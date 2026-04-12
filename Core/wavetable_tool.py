@@ -419,13 +419,13 @@ class App(tk.Tk):
         # Bank navigator — only shown in Open Banks mode
         self.bank_nav_frame = tk.Frame(p, bg=C["panel"])
         self.bank_nav_frame.pack(fill="x", padx=10, pady=(0, 4))
-        self._sbtn("◀", self._prev_bank).pack(side="left", in_=self.bank_nav_frame)
+        self._sbtn(self.bank_nav_frame, "◀", self._prev_bank).pack(side="left")
         self.bank_nav_lbl = tk.Label(
             self.bank_nav_frame, text="",
             font=("Consolas", 9, "bold"),
             bg=C["panel"], fg=C["hot"], padx=8)
         self.bank_nav_lbl.pack(side="left", in_=self.bank_nav_frame)
-        self._sbtn("▶", self._next_bank).pack(side="left", in_=self.bank_nav_frame)
+        self._sbtn(self.bank_nav_frame, "▶", self._next_bank).pack(side="left")
         self.bank_nav_frame.pack_forget()
 
         self._sep(p)
@@ -471,19 +471,6 @@ class App(tk.Tk):
                      values=EXPORT_SIZES, state="readonly", width=9,
                      font=("Consolas", 9)).pack(anchor="w", padx=10, pady=(2, 8))
 
-        # Cycles to export: label + [−] N [+] on one row
-        row = tk.Frame(p, bg=C["panel"])
-        row.pack(fill="x", padx=10, pady=(0, 2))
-        tk.Label(row, text="Cycles:", font=("Consolas", 9),
-                 bg=C["panel"], fg=C["text"]).pack(side="left")
-        self._sbtn("−", self._dec_n).pack(side="left", padx=(6, 2))
-        tk.Label(row, textvariable=self.export_n_var, width=3,
-                 font=("Consolas", 10, "bold"),
-                 bg=C["panel"], fg=C["hot"]).pack(side="left")
-        self._sbtn("+", self._inc_n).pack(side="left", padx=(2, 0))
-        tk.Label(p, text="(0 = all)", font=("Consolas", 8),
-                 bg=C["panel"], fg=C["muted"]).pack(anchor="w", padx=10, pady=(0, 6))
-
         self._sep(p)
 
         # WAVETABLE HEADER
@@ -500,6 +487,21 @@ class App(tk.Tk):
                                      wraplength=210, justify="left")
         self.clm_desc_lbl.pack(anchor="w", padx=10, pady=(0, 6))
         self._sep(p)
+
+        # Cycles to export: label + [−] N [+] on one row — just before export buttons
+        n_row = tk.Frame(p, bg=C["panel"])
+        n_row.pack(fill="x", padx=10, pady=(0, 2))
+        tk.Label(n_row, text="Cycles to export:",
+                 font=("Consolas", 9), bg=C["panel"],
+                 fg=C["text"]).pack(side="left")
+        self._sbtn(n_row, "−", self._dec_n).pack(side="left", padx=(6, 2))
+        tk.Label(n_row, textvariable=self.export_n_var, width=3,
+                 font=("Consolas", 10, "bold"),
+                 bg=C["panel"], fg=C["hot"]).pack(side="left")
+        self._sbtn(n_row, "+", self._inc_n).pack(side="left", padx=(2, 0))
+        tk.Label(p, text="(0 = all)",
+                 font=("Consolas", 8), bg=C["panel"],
+                 fg=C["muted"]).pack(anchor="w", padx=10, pady=(0, 6))
 
         # Export buttons
         for txt, cmd in [("Export current cycle",    self._exp_solo),
@@ -549,9 +551,10 @@ class App(tk.Tk):
                                     font=("Consolas", 10, "bold"),
                                     bg=C["bg"], fg=C["hot"], padx=10)
         self.cycle_badge.pack(side="left")
-        # Prev / Next cycle buttons
-        self._sbtn("◀", self._prev_cycle).pack(side="left", padx=(12, 2))
-        self._sbtn("▶", self._next_cycle).pack(side="left")
+        # Prev / Next cycle buttons — parented to info_row
+        self._sbtn(info_row, "◀", self._prev_cycle).pack(side="left", padx=(12, 2))
+        self._sbtn(info_row, "▶", self._next_cycle).pack(side="left")
+        self._sbtn(info_row, "▶ Play", self._play_cycle).pack(side="left", padx=(16, 0))
 
         # ── ALL CYCLES thumbnails ──
         tk.Label(p, text="ALL CYCLES",
@@ -583,8 +586,9 @@ class App(tk.Tk):
                          activeforeground="#fff",
                          relief="flat", bd=0, padx=6, pady=4, cursor="hand2")
 
-    def _sbtn(self, text, cmd):
-        return tk.Button(self, text=text, command=cmd,
+    def _sbtn(self, parent, text, cmd):
+        """Small button anchored to parent frame."""
+        return tk.Button(parent, text=text, command=cmd,
                          font=("Consolas", 9),
                          bg=C["accent"], fg=C["text"],
                          activebackground=C["hot"],
@@ -827,6 +831,41 @@ class App(tk.Tk):
                 f"{b.bit_depth}-bit  |  {len(b.cycles)} cycles × {b.cycle_size} samp")
 
     # ── Navigation ───────────────────────────────────────────────────────────
+    def _play_cycle(self):
+        """
+        Play the currently displayed cycle as a looped tone for ~1 second.
+        Uses winsound on Windows (built-in, no extra deps).
+        Falls back to a beep if unavailable.
+        """
+        if not self.cycles:
+            return
+        import tempfile, threading
+        cycle  = self.cycles[self.cycle_idx]
+        sr     = self.bank.sr if self.bank else 44100
+        target = self.export_size_var.get()
+        c      = resample_cycle(cycle, target)
+        # Build 1-second audio by tiling the cycle
+        n_rep  = max(1, sr // len(c))
+        audio  = np.tile(c, n_rep + 1)[:sr].astype(np.float32)
+        # Write temp WAV
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        write_wav_plain(tmp_path, audio, sr)
+        def _play():
+            try:
+                import winsound
+                winsound.PlaySound(tmp_path,
+                                   winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+        threading.Thread(target=_play, daemon=True).start()
+
     def _prev_bank(self):
         if self.banks:
             self._activate((self.bank_idx - 1) % len(self.banks))
