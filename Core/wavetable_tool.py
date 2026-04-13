@@ -327,6 +327,15 @@ def apply_crossfade(cycle: np.ndarray, n_samples: int) -> np.ndarray:
     return result
 
 
+def extract_harmonics(cycle: np.ndarray, n: int = 16) -> np.ndarray:
+    """Extract n harmonic amplitudes from cycle, normalized to [0,1]. H[0]=fundamental."""
+    fft  = np.abs(np.fft.rfft(cycle))
+    amps = np.array([float(fft[i+1]) if i+1 < len(fft) else 0.0
+                     for i in range(n)], dtype=np.float32)
+    mx   = amps.max()
+    return amps / mx if mx > 0 else amps
+
+
 def classify_cycle(cycle: np.ndarray) -> tuple:
     """
     Classify via FFT harmonic analysis.
@@ -699,7 +708,9 @@ class App(tk.Tk):
         self._lbl_section(p, "EDIT WAVEFORM")
         self._btn(p, "Edit current cycle...", self._open_editor).pack(
             fill="x", padx=10, pady=2)
-        self._btn(p, "New cycle from scratch", self._new_cycle).pack(
+        self._btn(p, "Create new bank", self._create_bank).pack(
+            fill="x", padx=10, pady=2)
+        self._btn(p, "Add empty cycle", self._add_empty_cycle).pack(
             fill="x", padx=10, pady=2)
         self._btn(p, "Scan WAV for cycles...", self._open_scanner).pack(
             fill="x", padx=10, pady=2)
@@ -758,6 +769,8 @@ class App(tk.Tk):
         self._sbtn(info_row, "▶", self._next_cycle).pack(side="left")
         self._sbtn(info_row, "▶ Play", self._play_cycle).pack(side="left", padx=(16, 0))
         self._sbtn(info_row, "Delete", self._delete_cycle).pack(side="left", padx=(8, 0))
+        self._sbtn(info_row, "← Move", self._cycle_move_left).pack(side="left", padx=(8,1))
+        self._sbtn(info_row, "→ Move", self._cycle_move_right).pack(side="left", padx=1)
         # Phase offset control
         phase_row = tk.Frame(self.panel_c, bg=C["bg"])
         phase_row.pack(fill="x", pady=(2, 0))
@@ -1089,6 +1102,28 @@ class App(tk.Tk):
         threading.Thread(target=_play, daemon=True).start()
 
 
+    def _cycle_move_left(self):
+        """Move current cycle one position to the left in the bank."""
+        b = self.bank
+        if not b or len(b.cycles) < 2 or self.cycle_idx == 0:
+            return
+        i = self.cycle_idx
+        b.cycles[i-1], b.cycles[i] = b.cycles[i], b.cycles[i-1]
+        b.audio = np.concatenate(b.cycles)
+        self.cycle_idx = i - 1
+        self._refresh()
+
+    def _cycle_move_right(self):
+        """Move current cycle one position to the right in the bank."""
+        b = self.bank
+        if not b or len(b.cycles) < 2 or self.cycle_idx >= len(b.cycles)-1:
+            return
+        i = self.cycle_idx
+        b.cycles[i], b.cycles[i+1] = b.cycles[i+1], b.cycles[i]
+        b.audio = np.concatenate(b.cycles)
+        self.cycle_idx = i + 1
+        self._refresh()
+
     def _delete_cycle(self):
         """Delete the currently displayed cycle from the active bank."""
         b = self.bank
@@ -1121,21 +1156,38 @@ class App(tk.Tk):
         """Reset phase offset display (does not undo shifts already applied)."""
         self.phase_offset_var.set(0)
 
-    def _new_cycle(self):
-        """Create a new bank with a single empty cycle and open the editor."""
+    def _create_bank(self):
+        """Create a brand-new empty bank and open the editor on its first cycle."""
         cs = self.cs_var.get()
-        b  = Bank(path="new_cycle.wav",
+        b  = Bank(path="new_bank.wav",
                   audio=np.zeros(cs, dtype=np.float32),
                   sr=self.export_sr_var.get(),
                   bit_depth=self.export_depth_var.get(),
                   chunk_info={})
         b.slice(cs)
-        self.banks    = [b]
-        self.bank_idx = 0
+        self.banks     = [b]
+        self.bank_idx  = 0
         self.cycle_idx = 0
         self._set_mode("file")
         self._activate(0)
         self._open_editor()
+
+    def _add_empty_cycle(self):
+        """Add a new empty cycle to the current bank and open the editor."""
+        cs = self.cs_var.get()
+        if not self.bank:
+            self._create_bank()
+            return
+        empty = np.zeros(cs, dtype=np.float32)
+        self.bank.cycles.append(empty)
+        self.bank.audio = np.concatenate(self.bank.cycles)
+        self.cycle_idx  = len(self.bank.cycles) - 1
+        self._refresh()
+        self._open_editor()
+
+    def _new_cycle(self):
+        """Legacy alias kept for compatibility."""
+        self._create_bank()
 
     def _open_editor(self):
         """Open the waveform editor Toplevel window."""
@@ -1351,6 +1403,22 @@ class App(tk.Tk):
             draw_canvas_wave()
             draw_preview()
 
+        def do_invert_v():
+            arr = np.array(buf[0], dtype=np.float32)
+            buf[0] = (-arr).tolist()
+            draw_canvas_wave(); draw_preview()
+
+        def do_invert_h():
+            buf[0] = buf[0][::-1]
+            draw_canvas_wave(); draw_preview()
+
+        invert_row = tk.Frame(tab_draw, bg=C["bg"])
+        invert_row.pack(anchor="w", padx=8, pady=(2, 0))
+        for txt, cmd in [("Invert V", do_invert_v), ("Mirror H", do_invert_h)]:
+            tk.Button(invert_row, text=txt, command=cmd,
+                      font=("Consolas", 8), bg=C["accent"], fg=C["text"],
+                      relief="flat", bd=0, padx=8, pady=3).pack(side="left", padx=(0,4))
+
         # Periodicity tools row
         period_row = tk.Frame(tab_draw, bg=C["bg"])
         period_row.pack(anchor="w", padx=8, pady=(2, 2))
@@ -1482,46 +1550,63 @@ class App(tk.Tk):
         # ════════════════════════════════════════════════════════════════════
         # TAB 3 — Harmonics
         # ════════════════════════════════════════════════════════════════════
-        harm_vars = [tk.DoubleVar(value=(1.0 if i == 0 else 0.0))
-                     for i in range(8)]
+        # Preload harmonic values from the current cycle buffer
+        _existing_harmonics = extract_harmonics(np.array(buf[0], dtype=np.float32), 16)
+        harm_vars = [tk.DoubleVar(value=float(_existing_harmonics[i]))
+                     for i in range(16)]
 
         def harm_update(*_):
-            t    = np.linspace(0, 2 * np.pi, cs, endpoint=False)
-            wave_h = np.zeros(cs)
+            t_h    = np.linspace(0, 2 * np.pi, cs, endpoint=False)
+            wave_h = np.zeros(cs, dtype=np.float64)
             for i, v in enumerate(harm_vars):
-                amp = v.get()
+                amp = float(v.get())
                 if abs(amp) > 1e-6:
-                    wave_h += amp * np.sin((i + 1) * t)
-            mx = np.max(np.abs(wave_h))
-            if mx > 0:
+                    wave_h += amp * np.sin((i + 1) * t_h)
+            mx = float(np.max(np.abs(wave_h)))
+            if mx > 1e-10:
                 wave_h /= mx
-            buf[0] = wave_h.tolist()
+            buf[0] = wave_h.astype(np.float32).tolist()
             draw_canvas_wave()
             draw_preview()
 
-        tk.Label(tab_harm, text="Harmonic amplitudes (H1=fundamental)",
+        # Scrollable frame for 16 harmonics
+        tk.Label(tab_harm, text="Harmonic amplitudes — H1=fundamental (matches FFT labels)",
                  font=("Consolas", 8), bg=C["bg"], fg=C["muted"]
-                 ).grid(row=0, column=0, columnspan=2,
-                        sticky="w", padx=12, pady=(10, 4))
-        for i, hv in enumerate(harm_vars):
-            lbl = f"H{i+1} {'(fund)' if i==0 else '       '}"
-            tk.Label(tab_harm, text=lbl, font=("Consolas", 9),
-                     bg=C["bg"], fg=C["text"]).grid(
-                         row=i+1, column=0, sticky="w", padx=12, pady=3)
-            sl = tk.Scale(tab_harm, variable=hv,
-                          from_=0.0, to=1.0, resolution=0.01,
-                          orient="horizontal", bg=C["bg"], fg=C["text"],
-                          troughcolor=C["accent"],
-                          highlightthickness=0, length=280,
-                          command=lambda v: harm_update())
-            sl.grid(row=i+1, column=1, padx=8, pady=3, sticky="w")
+                 ).pack(anchor="w", padx=12, pady=(8, 2))
+        harm_scroll_outer = tk.Frame(tab_harm, bg=C["bg"])
+        harm_scroll_outer.pack(fill="both", expand=True, padx=8)
+        harm_cv = tk.Canvas(harm_scroll_outer, bg=C["bg"], highlightthickness=0)
+        harm_sb = ttk.Scrollbar(harm_scroll_outer, orient="vertical",
+                                command=harm_cv.yview)
+        harm_cv.configure(yscrollcommand=harm_sb.set)
+        harm_sb.pack(side="right", fill="y")
+        harm_cv.pack(side="left", fill="both", expand=True)
+        harm_inner = tk.Frame(harm_cv, bg=C["bg"])
+        harm_cv.create_window((0,0), window=harm_inner, anchor="nw")
+        harm_inner.bind("<Configure>",
+            lambda e: harm_cv.configure(scrollregion=harm_cv.bbox("all")))
 
-        tk.Button(tab_harm, text="Apply harmonics",
-                  command=harm_update,
-                  font=("Consolas", 9),
-                  bg=C["hot"], fg="#fff",
-                  relief="flat", bd=0, padx=10, pady=4).grid(
-                      row=9, column=0, columnspan=2, pady=12)
+        for i, hv in enumerate(harm_vars):
+            row_f = tk.Frame(harm_inner, bg=C["bg"])
+            row_f.pack(fill="x", pady=1)
+            tk.Label(row_f, text=f"H{i+1:2d}", width=4,
+                     font=("Consolas", 9), bg=C["bg"],
+                     fg=C["hot"] if i==0 else C["text"]).pack(side="left", padx=(8,2))
+            sl = tk.Scale(row_f, variable=hv, from_=0.0, to=1.0,
+                          resolution=0.01, orient="horizontal",
+                          bg=C["bg"], fg=C["text"],
+                          troughcolor=C["accent"],
+                          highlightthickness=0, length=240,
+                          showvalue=False,
+                          command=lambda v: None)
+            sl.pack(side="left")
+            tk.Label(row_f, textvariable=hv, width=4,
+                     font=("Consolas", 8), bg=C["bg"],
+                     fg=C["muted"]).pack(side="left", padx=4)
+
+        tk.Button(tab_harm, text="Apply harmonics", command=harm_update,
+                  font=("Consolas", 9), bg=C["hot"], fg="#fff",
+                  relief="flat", bd=0, padx=10, pady=4).pack(pady=6)
 
         # ════════════════════════════════════════════════════════════════════
         # TAB 4 — Layer (blend cycles from bank or external WAV)
@@ -1745,6 +1830,8 @@ class App(tk.Tk):
                               bg=C["panel"], fg=C["text"],
                               relief="flat")
         freq_entry.pack(side="left")
+        freq_entry.bind("<Return>",
+                        lambda e: run_detection(manual_freq=freq_var.get()))
         note_lbl = tk.Label(top, text="",
                             font=("Consolas", 8), bg=C["panel"], fg=C["muted"])
         note_lbl.pack(side="left", padx=4)
@@ -1822,6 +1909,18 @@ class App(tk.Tk):
                 f"{len(sel)} cycle(s) → {target} samples",
                 parent=sc)
 
+        def select_best():
+            if not scan_cycles[0]: return
+            best = max(scan_cycles[0], key=lambda c: c["stability"])
+            selected_idx[0] = {best["index"]}
+            draw_overview(); draw_detail()
+            freq_info = f"{scan_freq[0]:.1f} Hz  |  {len(scan_cycles[0])} cycles  |  period: {scan_sr[0]/scan_freq[0]:.1f} samp"
+            info_lbl.config(text=freq_info + f"  |  Best: cycle {best['index']+1} (stab {best['stability']:.3f})")
+
+        tk.Button(bot, text="Select best", command=select_best,
+                  font=("Consolas", 9), bg=C["accent"], fg=C["text"],
+                  relief="flat", bd=0, padx=8, pady=4).pack(side="left", padx=(0,8))
+
         tk.Button(bot, text="Add to bank",
                   command=add_selected,
                   font=("Consolas", 9),
@@ -1850,7 +1949,7 @@ class App(tk.Tk):
                 x  = int(cyc["start"] / n * w)
                 x2 = int(cyc["end"]   / n * w)
                 is_sel = cyc["index"] in selected_idx[0]
-                color  = C["hot"] if is_sel else C["wave"]
+                color  = "#00bcd4" if is_sel else C["wave"]
                 overview_cv.create_line(x, 0, x, h,
                                         fill=color, width=1,
                                         dash=() if is_sel else (3,3))
@@ -1887,9 +1986,11 @@ class App(tk.Tk):
             disc = boundary_discontinuity(data)
             disc_col = "#c0392b" if disc > 0.20 else (
                        "#e67e22" if disc > 0.05 else "#2ecc71")
+            periodic_ok = disc < 0.05
+            periodic_txt = "periodic OK" if periodic_ok else (
+                           "slight discontinuity" if disc < 0.20 else "NOT periodic")
             detail_cv.create_text(8, 8,
-                text=f"{len(sel)} cycle(s) selected | "
-                     f"disc={disc:.3f}",
+                text=f"{len(sel)} cycle(s)  |  disc={disc:.3f}  |  {periodic_txt}",
                 font=("Consolas", 8), fill=disc_col, anchor="nw")
 
         def on_overview_click(event):
@@ -1911,13 +2012,13 @@ class App(tk.Tk):
                 selected_idx[0].add(best_i)
             draw_overview()
             draw_detail()
-            # Update info
+            # Update info — keep base freq info, append selection details
             sel = sorted(selected_idx[0])
+            freq_info = f"{scan_freq[0]:.1f} Hz  |  {len(scan_cycles[0])} cycles  |  period: {scan_sr[0]/scan_freq[0]:.1f} samp"
             if sel:
                 stabs = [scan_cycles[0][i]["stability"] for i in sel]
-                info_lbl.config(
-                    text=f"Selected: {sel}  |  "
-                         f"avg stability: {np.mean(stabs):.3f}")
+                sel_info = f"  |  Selected: {[s+1 for s in sel]}  |  avg stability: {np.mean(stabs):.3f}"
+                info_lbl.config(text=freq_info + sel_info)
 
         overview_cv.bind("<Button-1>", on_overview_click)
         overview_cv.bind("<Configure>", lambda e: draw_overview())
@@ -1937,10 +2038,15 @@ class App(tk.Tk):
             cycles = extract_cycles_from_audio(audio, sr, freq)
             scan_cycles[0] = cycles
             selected_idx[0].clear()
-            # Auto-select the most stable cycle
+            # Auto-select the most stable cycle (not necessarily the first)
             if cycles:
                 best = max(cycles, key=lambda c: c["stability"])
                 selected_idx[0].add(best["index"])
+                # Show best cycle info in detail
+                info_lbl.config(
+                    text=f"Detected: {freq:.1f} Hz  |  {len(cycles)} cycles  |  "
+                         f"period: {sr/freq:.1f} samples  |  "
+                         f"Best: cycle {best['index']+1} (stability {best['stability']:.3f})")
             info_lbl.config(
                 text=f"Detected: {freq:.1f} Hz  |  "
                      f"{len(cycles)} cycles  |  "
