@@ -370,6 +370,95 @@ def classify_cycle(cycle: np.ndarray) -> tuple:
 # ---------------------------------------------------------------------------
 #  Data model
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+#  Frequency detection & cycle scanner helpers
+# ---------------------------------------------------------------------------
+def detect_fundamental(audio: np.ndarray, sr: int,
+                        f_min: float = 20.0,
+                        f_max: float = 4000.0) -> float:
+    """
+    Detect fundamental frequency using NSDF (Normalized Square Difference).
+    Avoids the low-lag plateau issue of raw autocorrelation.
+    Returns frequency in Hz.
+    """
+    lag_min = max(2, int(sr / f_max))
+    lag_max = min(len(audio) // 2, int(sr / f_min))
+    if lag_min >= lag_max:
+        return 440.0
+    n     = len(audio)
+    fft_a = np.fft.rfft(audio - float(audio.mean()), n=2 * n)
+    acorr = np.fft.irfft(fft_a * np.conj(fft_a))[:n].real
+    energy = float(acorr[0])
+    if energy < 1e-10:
+        return 440.0
+    nsdf    = acorr / energy
+    segment = nsdf[lag_min:lag_max]
+    # Find first downward zero-crossing (valley), then best peak after it
+    first_valley = 0
+    for i in range(1, len(segment)):
+        if segment[i - 1] > 0 >= segment[i]:
+            first_valley = i
+            break
+    if first_valley > 0 and first_valley < len(segment):
+        sub = segment[first_valley:]
+        best_lag = lag_min + first_valley + int(np.argmax(sub))
+    else:
+        best_lag = lag_min + int(np.argmax(segment))
+    return float(sr / max(best_lag, 1))
+
+
+def freq_to_note(freq: float) -> str:
+    """Convert frequency to nearest note name + cents offset string."""
+    if freq <= 0:
+        return "—"
+    names  = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+    midi_f = 69 + 12 * np.log2(max(freq, 1.0) / 440.0)
+    midi_n = int(round(midi_f))
+    cents  = (midi_f - midi_n) * 100
+    name   = names[midi_n % 12] + str(midi_n // 12 - 1)
+    sign   = "+" if cents >= 0 else ""
+    return f"{name} ({sign}{cents:.0f}¢)"
+
+
+def find_zero_crossing_start(audio: np.ndarray, period: float) -> int:
+    """Find first positive-slope zero crossing within two periods."""
+    limit = min(int(period * 2), len(audio) - 1)
+    for i in range(1, limit):
+        if audio[i - 1] <= 0 < audio[i]:
+            return i
+    return 0
+
+
+def extract_cycles_from_audio(audio: np.ndarray, sr: int,
+                               freq: float) -> list:
+    """
+    Extract all complete cycles from audio at the given frequency.
+    Returns list of dicts: {index, start, end, audio, stability}.
+    """
+    period    = sr / freq
+    start_off = find_zero_crossing_start(audio, period)
+    cycles    = []
+    first     = None
+    pos       = float(start_off)
+    while pos + period <= len(audio):
+        s = int(round(pos))
+        e = min(int(round(pos + period)), len(audio))
+        if e - s >= 4:
+            cyc = audio[s:e].copy()
+            if first is None:
+                first = cyc
+            ref = np.interp(np.linspace(0, 1, len(cyc), endpoint=False),
+                            np.linspace(0, 1, len(first), endpoint=False),
+                            first)
+            na, nr = np.linalg.norm(cyc), np.linalg.norm(ref)
+            stab = float(np.dot(cyc, ref) / (na * nr + 1e-10))                    if na * nr > 0 else 0.0
+            cycles.append({"index": len(cycles), "start": s, "end": e,
+                           "audio": cyc, "stability": stab})
+        pos += period
+    return cycles
+
+
 class Bank:
     """One loaded wavetable file (or assembled waveform collection)."""
     def __init__(self, path, audio, sr, bit_depth, chunk_info):
@@ -611,6 +700,8 @@ class App(tk.Tk):
         self._btn(p, "Edit current cycle...", self._open_editor).pack(
             fill="x", padx=10, pady=2)
         self._btn(p, "New cycle from scratch", self._new_cycle).pack(
+            fill="x", padx=10, pady=2)
+        self._btn(p, "Scan WAV for cycles...", self._open_scanner).pack(
             fill="x", padx=10, pady=2)
         self._sep(p)
 
@@ -1071,10 +1162,12 @@ class App(tk.Tk):
 
         tab_draw = tk.Frame(nb, bg=C["bg"])
         tab_gen  = tk.Frame(nb, bg=C["bg"])
-        tab_harm = tk.Frame(nb, bg=C["bg"])
-        nb.add(tab_draw, text="  Draw  ")
-        nb.add(tab_gen,  text="  Generate  ")
-        nb.add(tab_harm, text="  Harmonics  ")
+        tab_harm  = tk.Frame(nb, bg=C["bg"])
+        tab_layer = tk.Frame(nb, bg=C["bg"])
+        nb.add(tab_draw,  text="  Draw  ")
+        nb.add(tab_gen,   text="  Generate  ")
+        nb.add(tab_harm,  text="  Harmonics  ")
+        nb.add(tab_layer, text="  Layer  ")
 
         # ── Shared preview canvas ────────────────────────────────────────────
         preview_frame = tk.Frame(ed, bg=C["panel"])
@@ -1430,9 +1523,466 @@ class App(tk.Tk):
                   relief="flat", bd=0, padx=10, pady=4).grid(
                       row=9, column=0, columnspan=2, pady=12)
 
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 4 — Layer (blend cycles from bank or external WAV)
+        # ════════════════════════════════════════════════════════════════════
+        layer_src_audio = [None]  # holds the source cycle to blend
+
+        lay_mix_var = tk.DoubleVar(value=0.5)
+        lay_op_var  = tk.StringVar(value="blend")
+
+        # Source selection
+        src_frame = tk.Frame(tab_layer, bg=C["bg"])
+        src_frame.pack(fill="x", padx=8, pady=(8, 4))
+        tk.Label(src_frame, text="Source:",
+                 font=("Consolas", 9), bg=C["bg"], fg=C["text"]).pack(
+                     side="left")
+
+        def load_layer_from_bank():
+            """Pick a cycle from the current bank as blend source."""
+            bc = self.bank
+            if not bc or not bc.cycles:
+                messagebox.showinfo("Layer", "No bank loaded.", parent=ed)
+                return
+            # Simple dialog: show cycle list
+            pick = tk.Toplevel(ed)
+            pick.title("Pick source cycle")
+            pick.configure(bg=C["bg"])
+            pick.geometry("300x320")
+            tk.Label(pick, text="Select cycle to use as blend source:",
+                     font=("Consolas", 9), bg=C["bg"], fg=C["text"],
+                     wraplength=280).pack(padx=12, pady=(10, 4))
+            lb = tk.Listbox(pick, font=("Consolas", 9),
+                            bg=C["panel"], fg=C["text"],
+                            selectbackground=C["accent"],
+                            height=12)
+            lb.pack(fill="both", expand=True, padx=12, pady=4)
+            for i, cyc in enumerate(bc.cycles):
+                lbl, _ = classify_cycle(cyc)
+                lb.insert(tk.END, f"Cycle {i+1:02d}  {lbl.upper()}")
+            def confirm():
+                sel = lb.curselection()
+                if not sel: return
+                idx = sel[0]
+                layer_src_audio[0] = resample_cycle(bc.cycles[idx], cs)
+                src_lbl.config(text=f"Bank cycle {idx+1}")
+                lay_preview()
+                pick.destroy()
+            tk.Button(pick, text="Use this cycle", command=confirm,
+                      font=("Consolas", 9),
+                      bg=C["hot"], fg="#fff",
+                      relief="flat", bd=0, padx=10, pady=4).pack(pady=8)
+
+        def load_layer_from_file():
+            """Load external WAV as blend source."""
+            path = filedialog.askopenfilename(
+                parent=ed, title="Open source WAV",
+                filetypes=[("WAV files", "*.wav")])
+            if not path: return
+            try:
+                audio, _, _, _ = read_wav(path)
+                src_cycle = audio[:cs] if len(audio) >= cs else audio
+                layer_src_audio[0] = resample_cycle(src_cycle, cs)
+                src_lbl.config(text=os.path.basename(path))
+                lay_preview()
+            except Exception as ex:
+                messagebox.showerror("Error", str(ex), parent=ed)
+
+        tk.Button(src_frame, text="From bank...", command=load_layer_from_bank,
+                  font=("Consolas", 9),
+                  bg=C["accent"], fg=C["text"],
+                  relief="flat", bd=0, padx=8, pady=3).pack(side="left", padx=(8,4))
+        tk.Button(src_frame, text="From WAV...", command=load_layer_from_file,
+                  font=("Consolas", 9),
+                  bg=C["accent"], fg=C["text"],
+                  relief="flat", bd=0, padx=8, pady=3).pack(side="left", padx=4)
+        src_lbl = tk.Label(src_frame, text="None",
+                           font=("Consolas", 8), bg=C["bg"], fg=C["muted"])
+        src_lbl.pack(side="left", padx=8)
+
+        # Operator selector
+        op_row = tk.Frame(tab_layer, bg=C["bg"])
+        op_row.pack(fill="x", padx=8, pady=(4, 2))
+        tk.Label(op_row, text="Operator:",
+                 font=("Consolas", 9), bg=C["bg"], fg=C["text"]).pack(side="left")
+        for name, val in [("Blend","blend"),("Add","add"),("Sub","subtract"),
+                          ("Mul","multiply"),("Min","min"),("Max","max")]:
+            tk.Radiobutton(op_row, text=name, variable=lay_op_var, value=val,
+                           bg=C["bg"], fg=C["text"],
+                           selectcolor=C["accent"],
+                           activebackground=C["bg"],
+                           font=("Consolas", 8)).pack(side="left", padx=3)
+
+        # Mix slider
+        mix_row = tk.Frame(tab_layer, bg=C["bg"])
+        mix_row.pack(fill="x", padx=8, pady=4)
+        tk.Label(mix_row, text="Mix (0=base, 1=source):",
+                 font=("Consolas", 9), bg=C["bg"], fg=C["text"]).pack(side="left")
+        tk.Scale(mix_row, variable=lay_mix_var, from_=0.0, to=1.0,
+                 resolution=0.01, orient="horizontal",
+                 bg=C["bg"], fg=C["text"],
+                 troughcolor=C["accent"],
+                 highlightthickness=0, length=220).pack(side="left", padx=8)
+
+        # Layer preview canvas
+        lay_cv = tk.Canvas(tab_layer, bg=C["panel"], height=120,
+                           highlightthickness=0)
+        lay_cv.pack(fill="x", padx=8, pady=4)
+
+        def lay_preview(*_):
+            lay_cv.delete("all")
+            w2, h2 = lay_cv.winfo_width(), lay_cv.winfo_height()
+            if w2 < 10: return
+            # Draw base (gray)
+            base_arr = np.array(buf[0], dtype=np.float32)
+            for col, arr, lw in [(C["muted"], base_arr, 1),
+                                  (C["wave"],
+                                   _compute_layer(base_arr), 2)]:
+                pts = []
+                for i, v in enumerate(arr):
+                    pts.extend([i/max(len(arr)-1,1)*w2,
+                                h2//2 - float(v)*(h2//2-4)])
+                if len(pts) >= 4:
+                    lay_cv.create_line(*pts, fill=col, width=lw)
+
+        def _compute_layer(base):
+            src = layer_src_audio[0]
+            if src is None: return base
+            mix = lay_mix_var.get()
+            op  = lay_op_var.get()
+            if op == "blend":    r = (1-mix)*base + mix*src
+            elif op == "add":    r = base + src*mix
+            elif op == "subtract": r = base - src*mix
+            elif op == "multiply": r = base*(1-mix+mix*src)
+            elif op == "min":    r = np.minimum(base, src*mix+base*(1-mix))
+            elif op == "max":    r = np.maximum(base, src*mix+base*(1-mix))
+            else:                r = base
+            mx = float(np.max(np.abs(r)))
+            return r/mx if mx > 1.0 else r
+
+        lay_cv.bind("<Configure>", lambda e: lay_preview())
+
+        def apply_layer():
+            src = layer_src_audio[0]
+            if src is None:
+                messagebox.showinfo("Layer", "Load a source first.", parent=ed)
+                return
+            base    = np.array(buf[0], dtype=np.float32)
+            result  = _compute_layer(base)
+            mx      = float(np.max(np.abs(result)))
+            if mx > 1.0: result /= mx
+            buf[0]  = result.tolist()
+            draw_canvas_wave()
+            draw_preview()
+
+        tk.Button(tab_layer, text="Apply layer",
+                  command=apply_layer,
+                  font=("Consolas", 9),
+                  bg=C["hot"], fg="#fff",
+                  relief="flat", bd=0, padx=10, pady=4).pack(pady=8)
+
         # Initial draw
         draw_canvas_wave()
         draw_preview()
+
+    def _open_scanner(self):
+        """
+        Cycle Scanner — separate window.
+        Load a WAV, detect fundamental frequency, display all extracted cycles,
+        let user pick one (or average several), then inject into current bank.
+        """
+        sc = tk.Toplevel(self)
+        sc.title("Cycle Scanner")
+        sc.configure(bg=C["bg"])
+        sc.geometry("820x600")
+        sc.resizable(True, True)
+
+        # State
+        scan_audio   = [None]
+        scan_sr      = [44100]
+        scan_cycles  = [[]]    # list of cycle dicts
+        scan_freq    = [0.0]
+        selected_idx = [set()]
+
+        # ── Top: file + freq controls ─────────────────────────────────────
+        top = tk.Frame(sc, bg=C["panel"], pady=6)
+        top.pack(fill="x", padx=0)
+
+        tk.Label(top, text="Source WAV:",
+                 font=("Consolas", 9), bg=C["panel"], fg=C["text"]).pack(
+                     side="left", padx=(10, 4))
+        file_lbl = tk.Label(top, text="No file",
+                            font=("Consolas", 9), bg=C["panel"], fg=C["wave"],
+                            width=24)
+        file_lbl.pack(side="left")
+
+        def open_source():
+            path = filedialog.askopenfilename(
+                parent=sc, title="Open source WAV",
+                filetypes=[("WAV files", "*.wav")])
+            if not path: return
+            try:
+                audio, sr, _, _ = read_wav(path)
+                scan_audio[0] = audio
+                scan_sr[0]    = sr
+                file_lbl.config(text=os.path.basename(path))
+                run_detection()
+            except Exception as ex:
+                messagebox.showerror("Error", str(ex), parent=sc)
+
+        tk.Button(top, text="Open WAV...", command=open_source,
+                  font=("Consolas", 9),
+                  bg=C["accent"], fg=C["text"],
+                  relief="flat", bd=0, padx=8, pady=3).pack(
+                      side="left", padx=8)
+
+        tk.Label(top, text="Freq (Hz):",
+                 font=("Consolas", 9), bg=C["panel"], fg=C["text"]).pack(
+                     side="left", padx=(8, 2))
+        freq_var = tk.DoubleVar(value=440.0)
+        freq_entry = tk.Entry(top, textvariable=freq_var, width=8,
+                              font=("Consolas", 9),
+                              bg=C["panel"], fg=C["text"],
+                              relief="flat")
+        freq_entry.pack(side="left")
+        note_lbl = tk.Label(top, text="",
+                            font=("Consolas", 8), bg=C["panel"], fg=C["muted"])
+        note_lbl.pack(side="left", padx=4)
+
+        tk.Button(top, text="Re-scan", command=lambda: run_detection(
+                    manual_freq=freq_var.get()),
+                  font=("Consolas", 9),
+                  bg=C["accent"], fg=C["text"],
+                  relief="flat", bd=0, padx=8, pady=3).pack(
+                      side="left", padx=8)
+
+        # ── Overview canvas: full waveform with cycle markers ─────────────
+        tk.Label(sc, text="Full sample — click a cycle marker to select/deselect",
+                 font=("Consolas", 8), bg=C["bg"], fg=C["muted"]).pack(
+                     anchor="w", padx=10, pady=(6, 1))
+        overview_cv = tk.Canvas(sc, bg=C["panel"], height=100,
+                                highlightthickness=0)
+        overview_cv.pack(fill="x", padx=10, pady=(0, 4))
+
+        # ── Detail canvas: selected cycle zoomed in ───────────────────────
+        tk.Label(sc, text="Selected cycle preview",
+                 font=("Consolas", 8), bg=C["bg"], fg=C["muted"]).pack(
+                     anchor="w", padx=10)
+        detail_cv = tk.Canvas(sc, bg=C["panel"], height=180,
+                              highlightthickness=0)
+        detail_cv.pack(fill="x", padx=10, pady=(0, 4))
+
+        # ── Info + controls ───────────────────────────────────────────────
+        info_row = tk.Frame(sc, bg=C["bg"])
+        info_row.pack(fill="x", padx=10, pady=4)
+        info_lbl = tk.Label(info_row, text="",
+                            font=("Consolas", 9), bg=C["bg"], fg=C["text"])
+        info_lbl.pack(side="left")
+
+        bot = tk.Frame(sc, bg=C["bg"])
+        bot.pack(fill="x", padx=10, pady=6)
+
+        tk.Label(bot, text="Export cycle size:",
+                 font=("Consolas", 9), bg=C["bg"], fg=C["text"]).pack(side="left")
+        out_cs_var = tk.IntVar(value=self.export_size_var.get())
+        ttk.Combobox(bot, textvariable=out_cs_var,
+                     values=EXPORT_SIZES, state="readonly", width=6,
+                     font=("Consolas", 9)).pack(side="left", padx=(4, 16))
+
+        def add_selected():
+            """Add selected cycles (or average) to the current bank."""
+            sel = sorted(selected_idx[0])
+            if not sel:
+                messagebox.showinfo("Scanner",
+                                    "Select at least one cycle first.", parent=sc)
+                return
+            target = out_cs_var.get()
+            cycles_to_add = [scan_cycles[0][i]["audio"] for i in sel]
+            if len(cycles_to_add) == 1:
+                final = resample_cycle(cycles_to_add[0], target)
+            else:
+                # Average selected cycles (all resampled to target first)
+                resampled = [resample_cycle(c, target) for c in cycles_to_add]
+                final     = np.mean(resampled, axis=0).astype(np.float32)
+            # Ensure bank exists
+            if not self.bank:
+                b = Bank("scanned.wav", final.copy(), scan_sr[0], 16, {})
+                b.slice(target)
+                self.banks    = [b]
+                self.bank_idx = 0
+                self._set_mode("file")
+            else:
+                self.bank.cycles.append(final)
+                self.bank.audio = np.concatenate(self.bank.cycles)
+            self.cycle_idx = len(self.bank.cycles) - 1
+            self._activate(self.bank_idx)
+            messagebox.showinfo(
+                "Scanner",
+                f"Added {'average of ' if len(sel)>1 else ''}"
+                f"{len(sel)} cycle(s) → {target} samples",
+                parent=sc)
+
+        tk.Button(bot, text="Add to bank",
+                  command=add_selected,
+                  font=("Consolas", 9),
+                  bg=C["hot"], fg="#fff",
+                  relief="flat", bd=0, padx=10, pady=4).pack(side="left")
+
+        # ── Drawing helpers ───────────────────────────────────────────────
+        def draw_overview():
+            overview_cv.delete("all")
+            audio = scan_audio[0]
+            if audio is None: return
+            w, h = overview_cv.winfo_width(), overview_cv.winfo_height()
+            if w < 10: return
+            n = len(audio)
+            # Waveform (downsampled for speed)
+            step = max(1, n // w)
+            pts  = []
+            for i in range(0, n, step):
+                x = int(i / n * w)
+                y = int(h//2 - float(audio[i]) * (h//2 - 4))
+                pts.extend([x, y])
+            if len(pts) >= 4:
+                overview_cv.create_line(*pts, fill=C["muted"], width=1)
+            # Cycle markers
+            for cyc in scan_cycles[0]:
+                x  = int(cyc["start"] / n * w)
+                x2 = int(cyc["end"]   / n * w)
+                is_sel = cyc["index"] in selected_idx[0]
+                color  = C["hot"] if is_sel else C["wave"]
+                overview_cv.create_line(x, 0, x, h,
+                                        fill=color, width=1,
+                                        dash=() if is_sel else (3,3))
+                # Stability indicator: height of small rect
+                sh = int(cyc["stability"] * (h//4))
+                overview_cv.create_rectangle(x, h-sh, x2, h,
+                                             fill=color, outline="",
+                                             stipple="gray50" if not is_sel else "")
+
+        def draw_detail():
+            detail_cv.delete("all")
+            sel = sorted(selected_idx[0])
+            if not sel or not scan_cycles[0]: return
+            w, h = detail_cv.winfo_width(), detail_cv.winfo_height()
+            if w < 10: return
+            # Show average if multiple selected, else single cycle
+            cyc_list = [scan_cycles[0][i]["audio"] for i in sel]
+            if len(cyc_list) > 1:
+                max_len = max(len(c) for c in cyc_list)
+                resampled = [resample_cycle(c, max_len) for c in cyc_list]
+                data = np.mean(resampled, axis=0)
+            else:
+                data = cyc_list[0]
+            # Draw zero line
+            detail_cv.create_line(0, h//2, w, h//2,
+                                  fill=C["muted"], dash=(3,3))
+            pts = []
+            for i, v in enumerate(data):
+                pts.extend([i / max(len(data)-1, 1) * w,
+                            h//2 - float(v) * (h//2 - 6)])
+            if len(pts) >= 4:
+                detail_cv.create_line(*pts, fill=C["wave"], width=1.5)
+            # Info
+            disc = boundary_discontinuity(data)
+            disc_col = "#c0392b" if disc > 0.20 else (
+                       "#e67e22" if disc > 0.05 else "#2ecc71")
+            detail_cv.create_text(8, 8,
+                text=f"{len(sel)} cycle(s) selected | "
+                     f"disc={disc:.3f}",
+                font=("Consolas", 8), fill=disc_col, anchor="nw")
+
+        def on_overview_click(event):
+            audio = scan_audio[0]
+            if audio is None: return
+            w  = overview_cv.winfo_width()
+            n  = len(audio)
+            sample_pos = int(event.x / w * n)
+            # Find nearest cycle
+            best_i, best_d = 0, n
+            for cyc in scan_cycles[0]:
+                d = abs(cyc["start"] - sample_pos)
+                if d < best_d:
+                    best_d, best_i = d, cyc["index"]
+            # Toggle selection
+            if best_i in selected_idx[0]:
+                selected_idx[0].discard(best_i)
+            else:
+                selected_idx[0].add(best_i)
+            draw_overview()
+            draw_detail()
+            # Update info
+            sel = sorted(selected_idx[0])
+            if sel:
+                stabs = [scan_cycles[0][i]["stability"] for i in sel]
+                info_lbl.config(
+                    text=f"Selected: {sel}  |  "
+                         f"avg stability: {np.mean(stabs):.3f}")
+
+        overview_cv.bind("<Button-1>", on_overview_click)
+        overview_cv.bind("<Configure>", lambda e: draw_overview())
+        detail_cv.bind("<Configure>", lambda e: draw_detail())
+
+        def run_detection(manual_freq=None):
+            audio = scan_audio[0]
+            if audio is None: return
+            sr    = scan_sr[0]
+            if manual_freq and manual_freq > 0:
+                freq = float(manual_freq)
+            else:
+                freq = detect_fundamental(audio, sr)
+            scan_freq[0] = freq
+            freq_var.set(round(freq, 2))
+            note_lbl.config(text=freq_to_note(freq))
+            cycles = extract_cycles_from_audio(audio, sr, freq)
+            scan_cycles[0] = cycles
+            selected_idx[0].clear()
+            # Auto-select the most stable cycle
+            if cycles:
+                best = max(cycles, key=lambda c: c["stability"])
+                selected_idx[0].add(best["index"])
+            info_lbl.config(
+                text=f"Detected: {freq:.1f} Hz  |  "
+                     f"{len(cycles)} cycles  |  "
+                     f"period: {sr/freq:.1f} samples")
+            draw_overview()
+            draw_detail()
+
+    def _zoom_in(self):
+        if not self.cycles: return
+        n    = len(self.cycles[self.cycle_idx])
+        z_s  = self._zoom_start
+        z_e  = n if self._zoom_end < 0 else self._zoom_end
+        mid  = (z_s + z_e) // 2
+        half = max(8, (z_e - z_s) // 4)
+        self._zoom_start = max(0, mid - half)
+        self._zoom_end   = min(n, mid + half)
+        self._draw_wave()
+
+    def _zoom_out(self):
+        if not self.cycles: return
+        n   = len(self.cycles[self.cycle_idx])
+        z_s = self._zoom_start
+        z_e = n if self._zoom_end < 0 else self._zoom_end
+        mid = (z_s + z_e) // 2
+        half = (z_e - z_s)
+        self._zoom_start = max(0, mid - half)
+        self._zoom_end   = min(n, mid + half)
+        if self._zoom_start == 0 and self._zoom_end >= n:
+            self._zoom_end = -1
+        self._draw_wave()
+
+    def _zoom_reset(self):
+        self._zoom_start = 0
+        self._zoom_end   = -1
+        self._draw_wave()
+
+    def _zoom_scroll(self, delta: int):
+        """Zoom in/out via mouse wheel on the oscilloscope."""
+        if delta > 0:
+            self._zoom_in()
+        else:
+            self._zoom_out()
 
     def _prev_bank(self):
         if self.banks:
@@ -1460,6 +2010,9 @@ class App(tk.Tk):
     def _refresh(self):
         if not self.cycles:
             return
+        # Reset zoom when cycle changes
+        self._zoom_start = 0
+        self._zoom_end   = -1
         n     = len(self.cycles)
         label, _ = classify_cycle(self.cycles[self.cycle_idx])
         self.cycle_nav_lbl.config(
@@ -1479,11 +2032,10 @@ class App(tk.Tk):
         w, h = cv.winfo_width(), cv.winfo_height()
         if w < 10 or h < 10:
             return
-        # Layout margins for axes labels
         lpad, rpad, tpad, bpad = 32, 8, 6, 18
-        dw = w - lpad - rpad   # drawable width
-        dh = h - tpad - bpad   # drawable height
-        # Grid + Y axis labels (-1, -0.5, 0, +0.5, +1)
+        dw = w - lpad - rpad
+        dh = h - tpad - bpad
+        # Y axis grid + labels
         for val, label in [(-1.0, "-1"), (-0.5, "-.5"), (0.0, "0"),
                            (0.5, "+.5"), (1.0, "+1")]:
             y = tpad + (1.0 - (val + 1) / 2) * dh
@@ -1492,39 +2044,40 @@ class App(tk.Tk):
                            dash=(4, 4) if val != 0 else ())
             cv.create_text(lpad - 3, y, text=label,
                            font=("Consolas", 7), fill=C["muted"], anchor="e")
-        # X axis — sample ticks
-        s      = self.cycles[self.cycle_idx]
-        n_samp = len(s)
-        n_ticks = min(8, n_samp)
-        step    = n_samp // n_ticks
-        for i in range(0, n_samp + 1, step):
-            if i > n_samp:
-                break
-            x = lpad + (i / max(n_samp - 1, 1)) * dw
+        # Get current cycle
+        s       = self.cycles[self.cycle_idx]
+        n_total = len(s)
+        # Apply zoom
+        z_start = max(0, self._zoom_start)
+        z_end   = n_total if self._zoom_end < 0 else min(self._zoom_end, n_total)
+        z_end   = max(z_start + 4, z_end)
+        s_view  = s[z_start:z_end]
+        n_view  = len(s_view)
+        # X axis ticks
+        n_ticks = min(8, n_view)
+        step    = max(1, n_view // max(n_ticks, 1))
+        for i in range(0, n_view, step):
+            x = lpad + (i / max(n_view - 1, 1)) * dw
             cv.create_line(x, h - bpad, x, h - bpad + 3, fill=C["muted"])
-            cv.create_text(x, h - 2, text=str(i),
+            cv.create_text(x, h - 2, text=str(z_start + i),
                            font=("Consolas", 7), fill=C["muted"], anchor="s")
-        # Waveform
+        # Waveform line
         pts = []
-        for i, v in enumerate(s):
-            x = lpad + (i / max(n_samp - 1, 1)) * dw
+        for i, v in enumerate(s_view):
+            x = lpad + (i / max(n_view - 1, 1)) * dw
             y = tpad + (1.0 - (float(v) + 1) / 2) * dh
             pts.extend([x, y])
         if len(pts) >= 4:
             cv.create_line(*pts, fill=C["wave"], width=1.5, smooth=False)
-        # Phase continuity indicator: vertical markers at start and end
+        # Phase continuity markers
         disc = boundary_discontinuity(s)
-        marker_color = "#c0392b" if disc > 0.20 else ("#e67e22" if disc > 0.05 else "#2ecc71")
-        marker_h = min(20, int(dh * 0.25))
-        # Start marker
-        cv.create_line(lpad, tpad, lpad, tpad + dh, fill=marker_color, width=2)
-        # End marker
-        cv.create_line(w - rpad, tpad, w - rpad, tpad + dh, fill=marker_color, width=2)
-        # Disc score label
+        mc   = "#c0392b" if disc > 0.20 else ("#e67e22" if disc > 0.05 else "#2ecc71")
+        cv.create_line(lpad, tpad, lpad, tpad + dh, fill=mc, width=2)
+        cv.create_line(w - rpad, tpad, w - rpad, tpad + dh, fill=mc, width=2)
         if disc > 0.01:
-            cv.create_text(lpad + 4, tpad + 4,
-                           text=f"disc={disc:.2f}",
-                           font=("Consolas", 7), fill=marker_color, anchor="nw")
+            cv.create_text(lpad + 4, tpad + 4, text=f"disc={disc:.2f}",
+                           font=("Consolas", 7), fill=mc, anchor="nw")
+
 
     def _draw_fft(self):
         cv = self.fft_cv
@@ -1696,6 +2249,7 @@ class App(tk.Tk):
         messagebox.showinfo("Export all complete", msg)
 
 
-# ---------------------------------------------------------------------------
+
+
 if __name__ == "__main__":
     App().mainloop()
