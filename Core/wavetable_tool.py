@@ -544,6 +544,10 @@ class App(tk.Tk):
         # Zoom state
         self._zoom_start: int = 0
         self._zoom_end:   int = -1
+        # Playback state
+        self._loop_running:  bool = False
+        self._loop_thread          = None
+        self._morph_cached         = None  # cached morphed cycle for play
         # Undo stack
         self._undo_stack: list = []
         self._max_undo:   int  = 30
@@ -824,20 +828,49 @@ class App(tk.Tk):
         # Phase offset control
         phase_row = tk.Frame(self.panel_c, bg=C["bg"])
         phase_row.pack(fill="x", pady=(2, 0))
-        tk.Label(phase_row, text="Phase offset:",
+        tk.Label(phase_row, text="Phase:",
                  font=("Consolas", 8), bg=C["bg"], fg=C["muted"]).pack(side="left")
         self.phase_offset_var = tk.IntVar(value=0)
-        self._sbtn(phase_row, "−1", lambda: self._shift_cycle(-1)).pack(side="left", padx=(6, 1))
-        self._sbtn(phase_row, "−10", lambda: self._shift_cycle(-10)).pack(side="left", padx=1)
-        self._sbtn(phase_row, "−100", lambda: self._shift_cycle(-100)).pack(side="left", padx=1)
-        tk.Label(phase_row, textvariable=self.phase_offset_var, width=6,
-                 font=("Consolas", 9, "bold"), bg=C["bg"], fg=C["hot"]).pack(side="left", padx=4)
-        self._sbtn(phase_row, "+100", lambda: self._shift_cycle(100)).pack(side="left", padx=1)
-        self._sbtn(phase_row, "+10",  lambda: self._shift_cycle(10)).pack(side="left", padx=1)
+        self.phase_slider_var = tk.IntVar(value=0)
+        self._sbtn(phase_row, "−100", lambda: self._shift_cycle(-100)).pack(side="left", padx=(4,1))
+        self._sbtn(phase_row, "−10",  lambda: self._shift_cycle(-10)).pack(side="left", padx=1)
+        self._sbtn(phase_row, "−1",   lambda: self._shift_cycle(-1)).pack(side="left", padx=1)
+        self.phase_sl = tk.Scale(phase_row, variable=self.phase_slider_var,
+                                 from_=-512, to=512, resolution=1,
+                                 orient="horizontal", length=120,
+                                 bg=C["bg"], fg=C["text"], troughcolor=C["accent"],
+                                 highlightthickness=0, showvalue=False,
+                                 command=self._on_phase_slider)
+        self.phase_sl.pack(side="left", padx=2)
+        tk.Label(phase_row, textvariable=self.phase_offset_var, width=5,
+                 font=("Consolas", 8, "bold"), bg=C["bg"], fg=C["hot"]).pack(side="left")
         self._sbtn(phase_row, "+1",   lambda: self._shift_cycle(1)).pack(side="left", padx=1)
-        self._sbtn(phase_row, "Reset", self._reset_phase).pack(side="left", padx=(6, 0))
+        self._sbtn(phase_row, "+10",  lambda: self._shift_cycle(10)).pack(side="left", padx=1)
+        self._sbtn(phase_row, "+100", lambda: self._shift_cycle(100)).pack(side="left", padx=1)
+        self._sbtn(phase_row, "Reset", self._reset_phase).pack(side="left", padx=(4, 0))
 
-        # ── Morph + spectral coherence row ──
+        # Playback controls
+        play_row = tk.Frame(self.panel_c, bg=C["bg"])
+        play_row.pack(fill="x", pady=(2, 0))
+        tk.Label(play_row, text="Play:",
+                 font=("Consolas", 8), bg=C["bg"], fg=C["muted"]).pack(side="left")
+        self._sbtn(play_row, "▶ Once",  self._play_cycle).pack(side="left", padx=(4,2))
+        self._sbtn(play_row, "↺ Loop",  self._play_loop).pack(side="left", padx=2)
+        self._sbtn(play_row, "■ Stop",  self._stop_play).pack(side="left", padx=2)
+        tk.Label(play_row, text="  Freq:",
+                 font=("Consolas", 8), bg=C["bg"], fg=C["muted"]).pack(side="left")
+        self.play_freq_var = tk.DoubleVar(value=440.0)
+        tk.Scale(play_row, variable=self.play_freq_var,
+                 from_=55.0, to=1760.0, resolution=1.0,
+                 orient="horizontal", length=120,
+                 bg=C["bg"], fg=C["text"], troughcolor=C["accent"],
+                 highlightthickness=0, showvalue=False).pack(side="left", padx=2)
+        self.play_freq_lbl = tk.Label(play_row, text="440 Hz",
+                                      font=("Consolas", 8), bg=C["bg"], fg=C["text"])
+        self.play_freq_lbl.pack(side="left")
+        self.play_freq_var.trace_add("write", self._on_freq_change)
+
+        # ── Morph row ──
         morph_row = tk.Frame(p, bg=C["bg"])
         morph_row.pack(fill="x", pady=(4, 0))
         tk.Label(morph_row, text="Morph:",
@@ -845,25 +878,32 @@ class App(tk.Tk):
         self.morph_var = tk.DoubleVar(value=0.0)
         tk.Scale(morph_row, variable=self.morph_var,
                  from_=0.0, to=1.0, resolution=0.01,
-                 orient="horizontal", length=180,
+                 orient="horizontal", length=160,
                  bg=C["bg"], fg=C["text"], troughcolor=C["accent"],
                  highlightthickness=0, showvalue=False,
                  command=self._on_morph).pack(side="left", padx=4)
-        self.morph_lbl = tk.Label(morph_row, text="A←→B",
+        self.morph_lbl = tk.Label(morph_row, text="C1←0.00→C2",
                                   font=("Consolas", 8), bg=C["bg"], fg=C["muted"])
         self.morph_lbl.pack(side="left", padx=4)
-        self.coh_lbl = tk.Label(morph_row, text="",
-                                font=("Consolas", 8), bg=C["bg"], fg=C["muted"])
-        self.coh_lbl.pack(side="right", padx=8)
-        # Spectral coherence strip
+        self._sbtn(morph_row, "Bake", self._bake_morph).pack(side="left", padx=(8,2))
+        self.morph_coh_lbl = tk.Label(morph_row, text="",
+                                      font=("Consolas", 8), bg=C["bg"], fg=C["muted"])
+        self.morph_coh_lbl.pack(side="right", padx=8)
+
+        # ── Spectral coherence canvas (bank + morph gradient) ──
         coh_frame = tk.Frame(p, bg=C["panel"])
-        coh_frame.pack(fill="x", pady=(2, 0))
-        tk.Label(coh_frame, text="SPECTRAL COHERENCE",
+        coh_frame.pack(fill="x", pady=(3, 0))
+        coh_hdr = tk.Frame(coh_frame, bg=C["panel"])
+        coh_hdr.pack(fill="x")
+        tk.Label(coh_hdr, text="SPECTRAL COHERENCE",
                  font=("Consolas", 7), bg=C["panel"], fg=C["muted"]).pack(
-                     anchor="w", padx=6, pady=(2, 0))
-        self.coh_cv = tk.Canvas(coh_frame, bg=C["panel"], height=36,
+                     side="left", padx=6, pady=(2,0))
+        self.coh_global_lbl = tk.Label(coh_hdr, text="global: —",
+                                       font=("Consolas", 7), bg=C["panel"], fg=C["muted"])
+        self.coh_global_lbl.pack(side="right", padx=6, pady=(2,0))
+        self.coh_cv = tk.Canvas(coh_frame, bg=C["panel"], height=48,
                                 highlightthickness=0)
-        self.coh_cv.pack(fill="x", padx=4, pady=(0, 2))
+        self.coh_cv.pack(fill="x", padx=4, pady=(0, 3))
         self.coh_cv.bind("<Configure>", lambda e: self._draw_coherence())
 
         # ── ALL CYCLES thumbnails ──
@@ -1146,22 +1186,13 @@ class App(tk.Tk):
 
     # ── Navigation ───────────────────────────────────────────────────────────
     def _play_cycle(self):
-        """
-        Play the currently displayed cycle as a looped tone for ~1 second.
-        Uses winsound on Windows (built-in, no extra deps).
-        Falls back to a beep if unavailable.
-        """
-        if not self.cycles:
-            return
+        """Play current cycle once (respects morph position and freq slider)."""
         import tempfile, threading
-        cycle  = self.cycles[self.cycle_idx]
-        sr     = self.bank.sr if self.bank else 44100
-        target = self.export_size_var.get()
-        c      = resample_cycle(cycle, target)
-        # Build 1-second audio by tiling the cycle
-        n_rep  = max(1, sr // len(c))
-        audio  = np.tile(c, n_rep + 1)[:sr].astype(np.float32)
-        # Write temp WAV
+        audio, sr = self._get_play_audio()
+        if audio is None:
+            return
+        # Trim to 1 second for "once" play
+        audio = audio[:sr]
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         tmp_path = tmp.name
         tmp.close()
@@ -1174,10 +1205,8 @@ class App(tk.Tk):
             except Exception:
                 pass
             finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+                try: os.unlink(tmp_path)
+                except Exception: pass
         threading.Thread(target=_play, daemon=True).start()
 
 
@@ -2184,6 +2213,17 @@ class App(tk.Tk):
         for i,v in enumerate(morphed):
             pts.extend([lp+i/max(len(morphed)-1,1)*dw, tp+(1.-(float(v)+1)/2)*dh])
         if len(pts)>=4: cv.create_line(*pts, fill="#ce93d8", width=1.5)
+        # Cache morphed cycle for play
+        self._morph_cached = morphed
+        # Compute morph coherence vs bank mean
+        if len(self.cycles) >= 2:
+            result   = spectral_coherence(self.cycles)
+            mean_p   = result["mean_profile"]
+            m_prof   = extract_harmonics(morphed, 16)
+            norm_a   = float(np.linalg.norm(m_prof))
+            norm_b   = float(np.linalg.norm(mean_p))
+            m_score  = float(np.dot(m_prof, mean_p)/(norm_a*norm_b+1e-10)) if norm_a*norm_b > 0 else 0.0
+            self._draw_coherence(morph_score=m_score)
         # Draw morphed FFT
         _,fft_m = classify_cycle(morphed)
         fc=self.fft_cv; fc.delete("all")
@@ -2202,26 +2242,168 @@ class App(tk.Tk):
                                     fill="#ce93d8" if ii==0 else C["fft"],outline="")
                 fc.create_text(xx+bw2//2,fh-4,text=lbls[ii],font=("Consolas",7),fill=C["muted"])
 
-    def _draw_coherence(self):
-        """Draw per-cycle spectral coherence as a colored bar strip."""
+    def _draw_coherence(self, morph_score: float = None):
+        """
+        Draw two rows in the coherence canvas:
+          Top row (h/2)  : per-cycle bars, current cycle highlighted
+          Bottom row     : morph gradient — horizontal blend from cyan to color
+                           at current morph position, with score label
+        """
         cv = self.coh_cv
         cv.delete("all")
-        if not self.cycles or len(self.cycles) < 2: return
+        if not self.cycles: return
         w, h = cv.winfo_width(), cv.winfo_height()
         if w < 10: return
-        result = spectral_coherence(self.cycles)
-        scores = result["per_cycle"]
-        glob   = result["global"]
-        n      = len(scores)
-        for i, score in enumerate(scores):
-            x  = int(i*w/n); bw = max(2, int(w/n)-2)
-            bh = int(score*(h-12))
-            col = "#2ecc71" if score>0.95 else ("#e67e22" if score>0.85 else "#c0392b")
-            cv.create_rectangle(x, h-12-bh, x+bw, h-12, fill=col, outline="")
-        gc = "#2ecc71" if glob>0.95 else ("#e67e22" if glob>0.85 else "#c0392b")
-        cv.create_text(w-4, 2, text=f"global:{glob:.3f}",
-                       font=("Consolas",7), fill=gc, anchor="ne")
-        self.coh_lbl.config(text=f"Coherence:{glob:.3f}", fg=gc)
+        row_h = h // 2
+        # ── Top row: per-cycle bars ──────────────────────────────────────────
+        if len(self.cycles) >= 2:
+            result = spectral_coherence(self.cycles)
+            scores = result["per_cycle"]
+            glob   = result["global"]
+            n      = len(scores)
+            gc = "#2ecc71" if glob>0.95 else ("#e67e22" if glob>0.85 else "#c0392b")
+            for i, score in enumerate(scores):
+                x  = int(i * w / n)
+                bw = max(2, int(w/n) - 2)
+                bh = int(score * (row_h - 4))
+                is_cur = (i == self.cycle_idx)
+                col = "#00bcd4" if is_cur else (
+                      "#2ecc71" if score>0.95 else
+                      "#e67e22" if score>0.85 else "#c0392b")
+                cv.create_rectangle(x, row_h-bh, x+bw, row_h, fill=col, outline="")
+                if is_cur:
+                    cv.create_text(x+bw//2, row_h-bh-2, text=f"{score:.2f}",
+                                   font=("Consolas",6), fill="#00bcd4", anchor="s")
+            self.coh_global_lbl.config(text=f"global: {glob:.3f}", fg=gc)
+        # ── Bottom row: morph coherence gradient ─────────────────────────────
+        t = float(self.morph_var.get()) if self.morph_var else 0.0
+        if t > 0 and len(self.cycles) >= 2 and morph_score is not None:
+            # Draw gradient bar: green at left → morph_col at morph position
+            steps = max(1, w)
+            morph_col = ("#2ecc71" if morph_score>0.95 else
+                         "#e67e22" if morph_score>0.85 else "#c0392b")
+            # Simplified: draw two rects
+            xm = int(t * w)
+            cv.create_rectangle(0, row_h+1, xm, h,
+                                 fill=morph_col, outline="")
+            cv.create_rectangle(xm, row_h+1, w, h,
+                                 fill=C["grid"], outline="")
+            cv.create_line(xm, row_h+1, xm, h, fill="#ffffff", width=1)
+            cv.create_text(min(xm+4, w-4), row_h+4,
+                           text=f"morph:{morph_score:.3f}",
+                           font=("Consolas",6), fill="#ffffff", anchor="nw")
+            self.morph_coh_lbl.config(
+                text=f"Morph coherence: {morph_score:.3f}", fg=morph_col)
+        else:
+            # No morph active — show help text
+            cv.create_text(4, row_h+2, text="← morph gradient (drag slider)",
+                           font=("Consolas",6), fill=C["muted"], anchor="nw")
+            self.morph_coh_lbl.config(text="", fg=C["muted"])
+
+    def _bake_morph(self):
+        """Add the current morphed waveform as a new cycle in the bank."""
+        if self._morph_cached is None:
+            self.status_var.set("Move the morph slider first.")
+            return
+        if not self.bank:
+            return
+        self._push_undo()
+        target = self.export_size_var.get()
+        baked  = resample_cycle(self._morph_cached, target)
+        self.bank.cycles.append(baked)
+        self.bank.audio = np.concatenate(self.bank.cycles)
+        self.cycle_idx  = len(self.bank.cycles) - 1
+        self._morph_cached = None
+        self.morph_var.set(0.0)
+        self._refresh()
+        self.status_var.set(f"Morph baked → cycle {self.cycle_idx+1}")
+
+    def _get_play_audio(self) -> tuple:
+        """Return (audio_array, sr) for playback, using morph cache if active."""
+        b = self.bank
+        if b is None:
+            return None, 44100
+        sr     = b.sr
+        freq   = float(self.play_freq_var.get()) if hasattr(self, 'play_freq_var') else 440.0
+        # Use morphed cycle if slider is active
+        if self._morph_cached is not None and float(self.morph_var.get()) > 0:
+            cycle = self._morph_cached
+        elif self.cycles:
+            cycle = self.cycles[self.cycle_idx]
+        else:
+            return None, sr
+        # Resample cycle to match the desired frequency
+        # target_samples = sr / freq
+        target_samples = max(8, int(round(sr / freq)))
+        c = resample_cycle(cycle, target_samples)
+        # Tile to ~2 seconds
+        n_rep = max(1, int(sr * 2 / len(c)))
+        audio = np.tile(c, n_rep + 1)[:sr * 2].astype(np.float32)
+        return audio, sr
+
+    def _play_loop(self):
+        """Start looped playback. Uses winsound on Windows."""
+        if self._loop_running:
+            return
+        self._loop_running = True
+        import tempfile, threading
+        audio, sr = self._get_play_audio()
+        if audio is None:
+            self._loop_running = False
+            return
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        write_wav_plain(tmp_path, audio, sr)
+        def _loop():
+            try:
+                import winsound
+                while self._loop_running:
+                    winsound.PlaySound(tmp_path,
+                                       winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+            except Exception:
+                pass
+            finally:
+                try: os.unlink(tmp_path)
+                except Exception: pass
+        self._loop_thread = threading.Thread(target=_loop, daemon=True)
+        self._loop_thread.start()
+        self.status_var.set("Looping — press ■ Stop to end.")
+
+    def _stop_play(self):
+        """Stop looped playback."""
+        self._loop_running = False
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+        self.status_var.set("Playback stopped.")
+
+    def _on_freq_change(self, *_):
+        """Update frequency label when slider moves."""
+        try:
+            freq = float(self.play_freq_var.get())
+            import math
+            note = freq_to_note(freq)
+            self.play_freq_lbl.config(text=f"{freq:.0f}Hz {note}")
+        except Exception:
+            pass
+
+    def _on_phase_slider(self, val):
+        """Phase slider moved — apply shift relative to last slider position."""
+        new_val = int(float(val))
+        old_val = getattr(self, '_phase_slider_last', 0)
+        delta   = new_val - old_val
+        if delta != 0 and self.bank and self.bank.cycles:
+            self.bank.cycles[self.cycle_idx] = shift_phase(
+                self.bank.cycles[self.cycle_idx], delta)
+            cur = self.phase_offset_var.get() + delta
+            cs  = self.bank.cycle_size
+            self.phase_offset_var.set(cur % cs if cur >= 0 else -((-cur) % cs))
+            self._phase_slider_last = new_val
+            self._draw_wave()
+            self._draw_fft()
 
     def _push_undo(self):
         b = self.bank
