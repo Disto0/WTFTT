@@ -350,34 +350,41 @@ def build_heatmap(cycles: list, n_harmonics: int = 16) -> 'np.ndarray':
     return arr
 
 
-def build_morph_coherence_path(cycles: list, n_steps: int = 200) -> 'np.ndarray':
+def build_morph_coherence_path(cycles: list, n_steps: int = 200,
+                               n_harmonics: int = 16) -> 'np.ndarray':
     """
-    Compute spectral coherence score along the full bank morph path.
-    Returns array of n_steps floats in [0,1].
+    Weighted spectral coherence along the morph path.
+    For each step, computes the weighted difference between adjacent cycle pairs:
+        score = 1 - sum_k( (1/k) * |A_k[i] - A_k[i+1]| ) * norm_factor
+    weight_k = 1/k → fundamental counts most, like human hearing.
+    Returns n_steps floats in [0,1].
     """
     if len(cycles) < 2:
         return np.ones(n_steps, dtype=np.float32)
-    mean_fft = np.mean(
-        [np.abs(np.fft.rfft(c))[:17] for c in cycles], axis=0).astype(np.float32)
+    weights = np.array([1.0/(k+1) for k in range(n_harmonics)], dtype=np.float32)
+    weights /= weights.sum()
+    profiles = []
+    for c in cycles:
+        fft  = np.abs(np.fft.rfft(c))
+        amps = np.array([float(fft[k+1]) if k+1 < len(fft) else 0.0
+                         for k in range(n_harmonics)], dtype=np.float32)
+        mx = float(amps.max())
+        profiles.append(amps / mx if mx > 0 else amps)
+    profiles = np.array(profiles, dtype=np.float32)
+    n      = len(cycles)
     result = []
-    n = len(cycles)
-    for i in range(n_steps):
-        pos   = i / (n_steps - 1) * (n - 1)
+    for step in range(n_steps):
+        pos   = step / max(n_steps-1, 1) * (n-1)
         idx_a = int(pos)
-        idx_b = min(idx_a + 1, n - 1)
+        idx_b = min(idx_a+1, n-1)
         t_m   = pos - idx_a
-        ca, cb = cycles[idx_a], cycles[idx_b]
-        sz = max(len(ca), len(cb))
-        if len(ca) != sz:
-            ca = np.interp(np.linspace(0,1,sz,endpoint=False),
-                           np.linspace(0,1,len(ca),endpoint=False), ca)
-        if len(cb) != sz:
-            cb = np.interp(np.linspace(0,1,sz,endpoint=False),
-                           np.linspace(0,1,len(cb),endpoint=False), cb)
-        m_fft = np.abs(np.fft.rfft(((1-t_m)*ca + t_m*cb).astype(np.float32)))[:17]
-        norm  = float(np.linalg.norm(m_fft)) * float(np.linalg.norm(mean_fft))
-        result.append(float(np.dot(m_fft, mean_fft) / norm) if norm > 0 else 0.0)
+        p_m   = (1-t_m)*profiles[idx_a] + t_m*profiles[idx_b]
+        delta = np.abs(profiles[idx_a] - profiles[idx_b])
+        score = max(0.0, 1.0 - float(np.dot(weights, delta)) * 2.0)
+        result.append(score)
     return np.array(result, dtype=np.float32)
+
+
 
 
 def spectral_coherence(cycles: list, n_harmonics: int = 16) -> dict:
@@ -869,8 +876,10 @@ class App(tk.Tk):
         self.wave_cv.bind("<MouseWheel>",   lambda e: self._zoom_scroll(e.delta))
         self.wave_cv.bind("<Button-4>",     lambda e: self._zoom_scroll(120))
         self.wave_cv.bind("<Button-5>",     lambda e: self._zoom_scroll(-120))
-        self.wave_cv.bind("<B2-Motion>",    self._on_pan_wave)  # middle-click drag
-        self.wave_cv.bind("<B3-Motion>",    self._on_pan_wave)  # right-click drag
+        self.wave_cv.bind("<B2-Motion>",     self._on_pan_wave)
+        self.wave_cv.bind("<B3-Motion>",     self._on_pan_wave)
+        self.wave_cv.bind("<ButtonPress-2>", lambda e: setattr(self,'_pan_last_x',e.x))
+        self.wave_cv.bind("<ButtonPress-3>", lambda e: setattr(self,'_pan_last_x',e.x))
 
         ff = tk.Frame(vis_row, bg=C["panel"])
         ff.grid(row=0, column=1, sticky="nsew")
@@ -892,7 +901,7 @@ class App(tk.Tk):
         tab_row = tk.Frame(p, bg=C["bg"])
         tab_row.pack(fill="x", pady=(2, 0))
         self._view_btns = {}
-        for lbl, mode in [("Waveform","waveform"),("FFT","fft"),
+        for lbl, mode in [("Waveform","waveform"),
                           ("Heatmap","heatmap"),("Lines","harmonic_lines")]:
             b = tk.Button(tab_row, text=lbl,
                           font=("Consolas", 8),
@@ -954,7 +963,6 @@ class App(tk.Tk):
         # Cycle navigation and actions — parented to info_row
         self._sbtn(info_row, "◀", self._prev_cycle).pack(side="left", padx=(12, 2))
         self._sbtn(info_row, "▶", self._next_cycle).pack(side="left")
-        self._sbtn(info_row, "▶ Play", self._play_cycle).pack(side="left", padx=(16, 0))
         self._sbtn(info_row, "Delete", self._delete_cycle).pack(side="left", padx=(8, 0))
         self._sbtn(info_row, "← Move", self._cycle_move_left).pack(side="left", padx=(8,1))
         self._sbtn(info_row, "→ Move", self._cycle_move_right).pack(side="left", padx=1)
@@ -2471,10 +2479,10 @@ class App(tk.Tk):
             self._selected_cycles.discard(idx)
         else:
             self._selected_cycles.add(idx)
-        if self._selected_cycles:
-            self._show_overlay_var.set(True)
+        # No auto-overlay — user controls checkbox
+        # Just redraw FFT with colored overlay bars per selection
         self._build_thumbs()
-        self._refresh_view()
+        self._draw_fft()
 
     def _draw_overlay(self):
         """Draw selected cycles as colored overlays on the wave canvas."""
@@ -2578,7 +2586,12 @@ class App(tk.Tk):
                            font=("Consolas", 7), fill=C["muted"])
 
     def _draw_harmonic_lines(self):
-        """Draw harmonic evolution curves: one line per harmonic across cycles."""
+        """
+        Draw harmonic amplitude evolution across cycles.
+        Each harmonic is normalized independently to [0,1] across all cycles,
+        so H1 and H6 are visually comparable (per-harmonic relative scaling).
+        Y axis: 0 = min amplitude for that harmonic, 1 = max.
+        """
         cv = self.wave_cv
         cv.delete("all")
         if not self.cycles or len(self.cycles) < 2:
@@ -2586,56 +2599,55 @@ class App(tk.Tk):
         w, h = cv.winfo_width(), cv.winfo_height()
         if w < 10: return
         n_harm = 12
-        lpad, rpad, tpad, bpad = 36, 8, 6, 18
-        dw, dh = w-lpad-rpad, h-tpad-bpad
+        lpad, rpad, tpad, bpad = 46, 8, 6, 18
+        dw, dh = w - lpad - rpad, h - tpad - bpad
+        # Y axis labels and grid
+        for yv, lbl in [(0.0,"0"),(0.25,".25"),(0.5,".5"),(0.75,".75"),(1.0,"1")]:
+            y = tpad + (1 - yv) * dh
+            cv.create_line(lpad, y, w-rpad, y, fill=C["grid"], dash=(2,4))
+            cv.create_text(lpad-3, y, text=lbl,
+                           font=("Consolas",7), fill=C["muted"], anchor="e")
         palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
                    "#c77dff","#f4845f","#48cae4","#e9c46a",
                    "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc"]
-        # Extract harmonic profiles
+        # Extract and normalize harmonic profiles
         profiles = []
         for c in self.cycles:
             fft  = np.abs(np.fft.rfft(c))
             amps = [float(fft[i+1]) if i+1 < len(fft) else 0.0
                     for i in range(n_harm)]
             profiles.append(amps)
-        profiles = np.array(profiles)
-        # Normalize each harmonic independently
+        profiles = np.array(profiles, dtype=np.float32)
         for hi in range(n_harm):
-            col = profiles[:,hi]
-            mn, mx = col.min(), col.max()
+            col = profiles[:, hi]
+            mn, mx = float(col.min()), float(col.max())
             if mx > mn:
-                profiles[:,hi] = (col-mn)/(mx-mn)
-        # Grid
-        for yf in [0.25,0.5,0.75,1.0]:
-            y = tpad + (1-yf)*dh
-            cv.create_line(lpad, y, w-rpad, y, fill=C["grid"], dash=(2,4))
-        # Draw one line per harmonic
-        n_cyc = len(self.cycles)
+                profiles[:, hi] = (col - mn) / (mx - mn)
+        # Draw lines
+        n_cyc    = len(self.cycles)
         legend_y = tpad + 2
-        lbls = ["H1(F)","H2","H3","H4","H5","H6","H7","H8",
-                "H9","H10","H11","H12"]
+        lbls     = ["H1(F)","H2","H3","H4","H5","H6",
+                    "H7","H8","H9","H10","H11","H12"]
         for hi in range(n_harm):
             if self._harmonic_filter and hi not in self._harmonic_filter:
                 continue
             color = palette[hi % len(palette)]
             pts   = []
             for ci in range(n_cyc):
-                x = lpad + ci/max(n_cyc-1,1)*dw
-                y = tpad + (1-profiles[ci,hi])*dh
-                pts.extend([x,y])
+                x = lpad + ci / max(n_cyc-1, 1) * dw
+                y = tpad + (1 - float(profiles[ci, hi])) * dh
+                pts.extend([x, y])
             if len(pts) >= 4:
                 cv.create_line(*pts, fill=color, width=1.5, smooth=True)
-            # Legend
-            if self._show_legend_var.get():
+            if self._show_legend_var and self._show_legend_var.get():
                 cv.create_rectangle(lpad+2, legend_y, lpad+10, legend_y+6,
                                     fill=color, outline="")
-                cv.create_text(lpad+14, legend_y+3,
-                               text=lbls[hi],
+                cv.create_text(lpad+14, legend_y+3, text=lbls[hi],
                                font=("Consolas",6), fill=color, anchor="w")
                 legend_y += 9
         # X axis: cycle numbers
         for ci in range(n_cyc):
-            x = lpad + ci/max(n_cyc-1,1)*dw
+            x = lpad + ci / max(n_cyc-1, 1) * dw
             cv.create_text(x, h-4, text=str(ci+1),
                            font=("Consolas",7), fill=C["muted"])
 
