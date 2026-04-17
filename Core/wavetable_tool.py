@@ -413,6 +413,67 @@ def spectral_coherence(cycles: list, n_harmonics: int = 16) -> dict:
             "harm_std": P.std(axis=0), "profiles": P, "mean_profile": mean}
 
 
+def fundamental_strength(cycle: np.ndarray) -> float:
+    """Ratio of fundamental amplitude to total harmonic content. 1.0 = pure sine."""
+    fft  = np.abs(np.fft.rfft(cycle))
+    if len(fft) < 2: return 0.0
+    total = fft[1:].sum()
+    return float(fft[1] / total) if total > 0 else 0.0
+
+
+def align_fft_phase(cycle: np.ndarray, ref_phase: float) -> tuple:
+    """
+    Align cycle so its fundamental phase matches ref_phase.
+    roll(x, k) changes phase by -2π*k/N → k = (cur_phase - ref_phase)*N/(2π)
+    Returns (aligned_cycle, shift_samples).
+    """
+    n      = len(cycle)
+    fft_c  = np.fft.rfft(cycle)
+    if len(fft_c) < 2:
+        return cycle.copy(), 0
+    cur_ph = float(np.angle(fft_c[1]))
+    diff   = cur_ph - ref_phase
+    while diff >  np.pi: diff -= 2*np.pi
+    while diff < -np.pi: diff += 2*np.pi
+    k = int(round(diff / (2*np.pi) * n))
+    return np.roll(cycle, k).astype(np.float32), k
+
+
+def align_xcorr(cycle: np.ndarray, reference: np.ndarray) -> tuple:
+    """
+    Align cycle to reference using circular cross-correlation.
+    argmax(xcorr(cycle, ref)) = k → roll(cycle, -k) aligns to ref.
+    Returns (aligned_cycle, shift_samples).
+    """
+    n     = max(len(cycle), len(reference))
+    c_fft = np.fft.rfft(cycle, n=n)
+    r_fft = np.fft.rfft(reference, n=n)
+    xcorr = np.fft.irfft(c_fft * np.conj(r_fft), n=n).real
+    k     = int(np.argmax(xcorr))
+    return np.roll(cycle, -k).astype(np.float32), k
+
+
+def align_multiharmonic(cycle: np.ndarray, ref_fft: np.ndarray,
+                         n_harm: int = 8) -> tuple:
+    """
+    Weighted multi-harmonic alignment.
+    Builds weighted spectral cross-correlation: weight_k = 1/k (human-hearing model).
+    Equivalent to finding shift that minimises weighted phase differences.
+    Returns (aligned_cycle, shift_samples).
+    """
+    n       = len(cycle)
+    weights = np.array([1.0/(k+1) for k in range(n_harm)])
+    weights /= weights.sum()
+    cyc_fft    = np.fft.rfft(cycle)
+    xcorr_spec = np.zeros(n, dtype=complex)
+    for k in range(1, n_harm+1):
+        if k >= len(cyc_fft) or k >= len(ref_fft): break
+        xcorr_spec[k] = weights[k-1] * cyc_fft[k] * np.conj(ref_fft[k])
+    xcorr = np.fft.ifft(xcorr_spec).real
+    shift = int(np.argmax(xcorr))
+    return np.roll(cycle, -shift).astype(np.float32), shift
+
+
 def extract_harmonics(cycle: np.ndarray, n: int = 16) -> np.ndarray:
     """Extract n harmonic amplitudes from cycle, normalized to [0,1]. H[0]=fundamental."""
     fft  = np.abs(np.fft.rfft(cycle))
@@ -606,7 +667,10 @@ class App(tk.Tk):
         self._show_overlay_var       = None
         self._show_legend_var        = None
         self._harmonic_filter: set   = set()
-        self._lines_normalized: bool  = True   # per-harmonic norm in Lines mode
+        self._lines_normalized: bool  = True
+        self._align_dirty:     bool   = False
+        self.align_mode_var            = None  # assigned in _build_panel_b
+        self.align_dirty_lbl           = None  # assigned in _build_panel_b   # per-harmonic norm in Lines mode
         # Zoom state
         self._zoom_start: int = 0
         self._zoom_end:   int = -1
@@ -844,6 +908,22 @@ class App(tk.Tk):
             fill="x", padx=10, pady=2)
         self._btn(p, "Scan WAV for cycles...", self._open_scanner).pack(
             fill="x", padx=10, pady=2)
+        self._sep(p)
+        self._lbl_section(p, "ALIGNMENT")
+        self.align_mode_var = tk.StringVar(value="auto")
+        align_modes = tk.Frame(p, bg=C["panel"])
+        align_modes.pack(fill="x", padx=10, pady=(2,4))
+        for lbl, val in [("Auto","auto"),("XCorr","xcorr"),("Multi-H","multiharmonic")]:
+            tk.Radiobutton(align_modes, text=lbl, variable=self.align_mode_var,
+                           value=val, bg=C["panel"], fg=C["text"],
+                           selectcolor=C["accent"], activebackground=C["panel"],
+                           font=("Consolas", 8)).pack(side="left", padx=2)
+        self._btn(p, "Auto-align cycles", self._auto_align_cycles).pack(
+            fill="x", padx=10, pady=2)
+        self.align_dirty_lbl = tk.Label(p, text="",
+                                        font=("Consolas", 8),
+                                        bg=C["panel"], fg="#e67e22")
+        self.align_dirty_lbl.pack(anchor="w", padx=10)
         self._sep(p)
 
         # Export buttons
@@ -2784,6 +2864,48 @@ class App(tk.Tk):
         self.status_var.set(f"Bank normalized: peak was {global_peak:.4f}, "
                             f"now 1.0 across {len(b.cycles)} cycles.")
 
+    def _auto_align_cycles(self):
+        """
+        Align all cycles to cycle[0].
+          auto         → FFT phase if fundamental_strength > 0.4, else xcorr
+          xcorr        → circular cross-correlation (most robust)
+          multiharmonic→ weighted 1/k multi-harmonic cross-correlation
+        """
+        b = self.bank
+        if not b or len(b.cycles) < 2:
+            self.status_var.set("Need ≥2 cycles to align.")
+            return
+        self._push_undo()
+        mode    = getattr(self.align_mode_var, 'get', lambda: 'auto')()
+        ref     = b.cycles[0]
+        ref_fft = np.fft.rfft(ref)
+        ref_ph  = float(np.angle(ref_fft[1]))
+        shifts  = []
+        for i in range(1, len(b.cycles)):
+            cyc   = b.cycles[i]
+            if mode == 'multiharmonic':
+                aligned, k = align_multiharmonic(cyc, ref_fft, n_harm=8)
+            elif mode == 'xcorr':
+                aligned, k = align_xcorr(cyc, ref)
+            else:  # auto
+                if fundamental_strength(cyc) > 0.4:
+                    aligned, k = align_fft_phase(cyc, ref_ph)
+                else:
+                    aligned, k = align_xcorr(cyc, ref)
+            b.cycles[i] = aligned
+            shifts.append(k)
+        b.audio = np.concatenate(b.cycles).astype(np.float32)
+        self._align_dirty = False
+        if hasattr(self, 'align_dirty_lbl') and self.align_dirty_lbl:
+            self.align_dirty_lbl.config(text="✓ Aligned", fg="#2ecc71")
+        self._draw_harmonic_lines() if self._view_mode == "harmonic_lines" else None
+        self._draw_coherence()
+        self._build_thumbs()
+        self.status_var.set(
+            f"Aligned {len(shifts)} cycles (mode: {mode}) — "
+            f"shifts: {[f'{k:+d}' for k in shifts[:4]]}"
+            + ("..." if len(shifts) > 4 else ""))
+
     def _bake_morph(self):
         """Add the current morphed waveform as a new cycle in the bank."""
         if self._morph_cached is None:
@@ -2972,9 +3094,13 @@ class App(tk.Tk):
     def _refresh(self):
         if not self.cycles:
             return
-        # Reset zoom when cycle changes
+        # Reset zoom when cycle changes (keep view mode)
         self._zoom_start = 0
         self._zoom_end   = -1
+        # Mark alignment as dirty
+        self._align_dirty = True
+        if hasattr(self, 'align_dirty_lbl') and self.align_dirty_lbl:
+            self.align_dirty_lbl.config(text="⚠ Re-align recommended", fg="#e67e22")
         n     = len(self.cycles)
         label, _ = classify_cycle(self.cycles[self.cycle_idx])
         self.cycle_nav_lbl.config(
