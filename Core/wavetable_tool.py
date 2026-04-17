@@ -327,11 +327,14 @@ def apply_crossfade(cycle: np.ndarray, n_samples: int) -> np.ndarray:
     return result
 
 
-def build_heatmap(cycles: list, n_harmonics: int = 16) -> 'np.ndarray':
+def build_heatmap(cycles: list, n_harmonics: int = 16,
+                   per_harmonic: bool = False) -> 'np.ndarray':
     """
-    Build a 2D heatmap array [n_cycles × n_harmonics].
-    Each cell = amplitude of harmonic H(j+1) in cycle i.
-    Values normalized per-harmonic across cycles to [0,1].
+    Build 2D heatmap [n_cycles × n_harmonics].
+    per_harmonic=False (default): global normalization → amplitudes are comparable
+      across rows and columns. Best for understanding relative energy.
+    per_harmonic=True: each column normalized independently to [0,1].
+      Best for seeing which cycles differ from each other per harmonic.
     """
     if not cycles:
         return np.zeros((0, n_harmonics), dtype=np.float32)
@@ -342,11 +345,18 @@ def build_heatmap(cycles: list, n_harmonics: int = 16) -> 'np.ndarray':
                          for i in range(n_harmonics)], dtype=np.float32)
         data.append(amps)
     arr = np.array(data, dtype=np.float32)
-    for h in range(n_harmonics):
-        col = arr[:, h]
-        mn, mx = float(col.min()), float(col.max())
-        if mx > mn:
-            arr[:, h] = (col - mn) / (mx - mn)
+    if per_harmonic:
+        # Normalize each harmonic column independently
+        for h in range(n_harmonics):
+            col = arr[:, h]
+            mn, mx = float(col.min()), float(col.max())
+            if mx > mn:
+                arr[:, h] = (col - mn) / (mx - mn)
+    else:
+        # Global normalization: divide by the single largest value
+        gmax = float(arr.max())
+        if gmax > 0:
+            arr /= gmax
     return arr
 
 
@@ -2538,15 +2548,20 @@ class App(tk.Tk):
             self.coh_global_lbl.config(text=f"global: {glob:.3f}", fg=gc)
              # ── Bottom row: full-bank morph coherence gradient ────────────────────────
         if len(self.cycles) >= 2:
-            path = build_morph_coherence_path(self.cycles, n_steps=max(w,2))
+            # Use fewer steps for performance (one rect per step, not per pixel)
+            n_steps = min(w, 120)
+            path = build_morph_coherence_path(self.cycles, n_steps=n_steps)
             fh2  = h - row_h - 1
-            for x_px in range(w):
-                score_px = float(path[min(x_px, len(path)-1)])
+            step_w = w / n_steps
+            for xi in range(n_steps):
+                score_px = float(path[xi])
                 r   = int(min(255, max(0, int((1-score_px)*2*255))))
                 g   = int(min(255, max(0, int(score_px*2*255))))
                 col = f"#{r:02x}{g:02x}40"
                 bh2 = max(1, int(score_px * fh2))
-                cv.create_line(x_px, h-bh2, x_px, h, fill=col)
+                x0  = int(xi * step_w)
+                x1  = int((xi+1) * step_w)
+                cv.create_rectangle(x0, h-bh2, x1, h, fill=col, outline="")
             # White cursor = global morph position
             gpos = float(self.global_morph_var.get()) if hasattr(self,'global_morph_var') else 0.0
             xm   = int(gpos * (w-1))
@@ -2685,7 +2700,10 @@ class App(tk.Tk):
         w, h = cv.winfo_width(), cv.winfo_height()
         if w < 10: return
         n_harm = 16
-        hm     = build_heatmap(self.cycles, n_harm)
+        use_per = (getattr(self,'_lines_norm_var',None) is not None
+                   and self._lines_norm_var.get())
+        hm     = build_heatmap(self.cycles, n_harm, per_harmonic=use_per)
+        norm_txt = "per-harm" if use_per else "global"
         n_cyc  = len(hm)
         if n_cyc == 0: return
 
@@ -2729,6 +2747,10 @@ class App(tk.Tk):
             cv.create_text(x_mid, h - bpad//2, text=lbls[hi],
                            font=("Consolas", 7), fill=C["muted"])
 
+        # Norm mode label
+        cv.create_text(lpad+3, tpad+2,
+                       text=f"norm:{norm_txt}",
+                       font=("Consolas",6), fill=C["hot"], anchor="nw")
         # Left separator line
         cv.create_line(lpad, tpad, lpad, h-bpad, fill=C["grid"], width=1)
 
@@ -3244,7 +3266,7 @@ class App(tk.Tk):
         half = max(8, (z_e - z_s) // 4)
         self._zoom_start = max(0, mid - half)
         self._zoom_end   = min(n, mid + half)
-        self._draw_wave()
+        self._refresh_view()
 
     def _zoom_out(self):
         if not self.cycles: return
@@ -3257,12 +3279,12 @@ class App(tk.Tk):
         self._zoom_end   = min(n, mid + half)
         if self._zoom_start == 0 and self._zoom_end >= n:
             self._zoom_end = -1
-        self._draw_wave()
+        self._refresh_view()
 
     def _zoom_reset(self):
         self._zoom_start = 0
         self._zoom_end   = -1
-        self._draw_wave()
+        self._refresh_view()
 
     def _zoom_scroll(self, delta: int):
         """Zoom in/out via mouse wheel on the oscilloscope."""
