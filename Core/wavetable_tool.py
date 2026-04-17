@@ -474,6 +474,24 @@ def align_multiharmonic(cycle: np.ndarray, ref_fft: np.ndarray,
     return np.roll(cycle, -shift).astype(np.float32), shift
 
 
+def extract_phases(cycle: np.ndarray, n: int = 16) -> np.ndarray:
+    """Extract harmonic phase angles [(-π,π]] for H1..Hn from cycle FFT."""
+    fft    = np.fft.rfft(cycle)
+    return np.array([float(np.angle(fft[i+1])) if i+1 < len(fft) else 0.0
+                     for i in range(n)], dtype=np.float32)
+
+
+def delta_phase(p1: float, p2: float) -> float:
+    """Circular phase difference: |p1-p2| wrapped to [0,π]."""
+    d = abs(p1 - p2) % (2*np.pi)
+    return float(min(d, 2*np.pi - d))
+
+
+def reconstruct_from_fft(cycle: np.ndarray) -> np.ndarray:
+    """IFFT(FFT(cycle)) — exact reconstruction for verification."""
+    return np.fft.irfft(np.fft.rfft(cycle), n=len(cycle)).astype(np.float32)
+
+
 def extract_harmonics(cycle: np.ndarray, n: int = 16) -> np.ndarray:
     """Extract n harmonic amplitudes from cycle, normalized to [0,1]. H[0]=fundamental."""
     fft  = np.abs(np.fft.rfft(cycle))
@@ -669,6 +687,10 @@ class App(tk.Tk):
         self._harmonic_filter: set   = set()
         self._lines_normalized: bool  = True
         self._align_dirty:     bool   = False
+        self._align_before:    list   = []
+        self._align_ab_mode:   str    = "B"
+        self._cycles_b_backup: list   = []
+        self.ab_btn                    = None
         self.align_mode_var            = None  # assigned in _build_panel_b
         self.align_dirty_lbl           = None  # assigned in _build_panel_b   # per-harmonic norm in Lines mode
         # Zoom state
@@ -985,7 +1007,8 @@ class App(tk.Tk):
         tab_row.pack(fill="x", pady=(2, 0))
         self._view_btns = {}
         for lbl, mode in [("Waveform","waveform"),
-                          ("Heatmap","heatmap"),("Lines","harmonic_lines")]:
+                          ("Heatmap","heatmap"),("Lines","harmonic_lines"),
+                          ("Phase","harmonic_phase"),("Reconstruct","fft_reconstruct")]:
             b = tk.Button(tab_row, text=lbl,
                           font=("Consolas", 8),
                           bg=C["hot"] if mode=="waveform" else C["accent"],
@@ -2552,17 +2575,22 @@ class App(tk.Tk):
         mode = self._view_mode
         if mode == "waveform":
             self._draw_wave()
-        elif mode == "fft":
-            self.wave_cv.delete("all")
-            self.wave_cv.create_text(10, 10, text="FFT always shown →",
-                font=("Consolas", 8), fill=C["muted"], anchor="nw")
         elif mode == "heatmap":
             self._draw_heatmap()
         elif mode == "harmonic_lines":
             self._draw_harmonic_lines()
+        elif mode == "harmonic_phase":
+            self._draw_harmonic_phase()
+        elif mode == "fft_reconstruct":
+            self._draw_fft_reconstruct()
         self._draw_fft()
-        if self._show_overlay_var.get() and self._selected_cycles:
-            self._draw_overlay()
+        if self._selected_cycles:
+            self._draw_fft_overlay()
+        if (mode == "waveform"
+                and self._show_overlay_var is not None
+                and self._show_overlay_var.get()
+                and self._selected_cycles):
+            self._draw_wave_overlay()
 
     def _toggle_cycle_selection(self, idx: int):
         """Toggle idx in multi-selection. Auto-enables overlay when non-empty."""
@@ -2645,7 +2673,11 @@ class App(tk.Tk):
 
 
     def _draw_heatmap(self):
-        """Draw spectral heatmap: cycles (Y) × harmonics (X), color = amplitude."""
+        """
+        Draw spectral heatmap: harmonics (X=H1…H16) × cycles (Y=C1…Cn).
+        Color scale: black=0 → blue → cyan → green → yellow → red=1
+        Per-harmonic normalization: each column independently scaled to [0,1].
+        """
         cv = self.wave_cv
         cv.delete("all")
         if not self.cycles:
@@ -2656,39 +2688,57 @@ class App(tk.Tk):
         hm     = build_heatmap(self.cycles, n_harm)
         n_cyc  = len(hm)
         if n_cyc == 0: return
-        cell_w = (w - 36) / n_harm
-        cell_h = (h - 16) / n_cyc
-        # Draw cells
+
+        # Layout margins
+        lpad = 28   # Y labels
+        bpad = 14   # X labels
+        tpad = 4
+        dw   = w - lpad
+        dh   = h - bpad - tpad
+        cell_w = dw / n_harm
+        cell_h = dh / n_cyc
+
+        def val_to_color(val):
+            v = max(0.0, min(1.0, float(val)))
+            if v < 0.25:   r,g,b = 0, 0, int(v*4*255)
+            elif v < 0.5:  r,g,b = 0, int((v-0.25)*4*255), 255
+            elif v < 0.75: r,g,b = 0, 255, int((1-(v-0.5)*4)*255)
+            else:           r,g,b = int((v-0.75)*4*255), 255, 0
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        # Draw cells + horizontal grid lines between rows
         for ci in range(n_cyc):
+            y1 = tpad + ci * cell_h
             for hi in range(n_harm):
-                val = float(hm[ci, hi])
-                # Color: black → blue → cyan → green → yellow → red
-                if val < 0.25:
-                    r,g,b = 0, 0, int(val*4*255)
-                elif val < 0.5:
-                    r,g,b = 0, int((val-0.25)*4*255), 255
-                elif val < 0.75:
-                    r,g,b = 0, 255, int((1-(val-0.5)*4)*255)
-                else:
-                    r,g,b = int((val-0.75)*4*255), 255, 0
-                col = f"#{r:02x}{g:02x}{b:02x}"
-                x1 = 36 + hi * cell_w
-                y1 = ci * cell_h
-                cv.create_rectangle(x1, y1, x1+cell_w-1, y1+cell_h-1,
-                                    fill=col, outline="")
-            # Y axis: cycle label
-            y_mid = ci * cell_h + cell_h/2
+                x1  = lpad + hi * cell_w
+                col = val_to_color(hm[ci, hi])
+                cv.create_rectangle(x1, y1, x1+cell_w, y1+cell_h,
+                                    fill=col, outline="#0a1929", width=1)
+            # Y axis label — centered in row, right-aligned to lpad
+            y_mid  = y1 + cell_h/2
             is_cur = (ci == self.cycle_idx)
-            cv.create_text(2, y_mid, text=f"C{ci+1}",
+            cv.create_text(lpad-3, y_mid, text=f"C{ci+1}",
                            font=("Consolas", 7),
                            fill="#00bcd4" if is_cur else C["muted"],
-                           anchor="w")
-        # X axis: harmonic labels
+                           anchor="e")
+
+        # X axis labels — centered under each column
         lbls = ["F","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16"]
         for hi in range(n_harm):
-            x_mid = 36 + hi * cell_w + cell_w/2
-            cv.create_text(x_mid, h-4, text=lbls[hi],
+            x_mid = lpad + hi * cell_w + cell_w/2
+            cv.create_text(x_mid, h - bpad//2, text=lbls[hi],
                            font=("Consolas", 7), fill=C["muted"])
+
+        # Left separator line
+        cv.create_line(lpad, tpad, lpad, h-bpad, fill=C["grid"], width=1)
+
+        # Color scale legend (right side, tiny)
+        legend_x = w - 10
+        for yi in range(100):
+            val = 1.0 - yi/100
+            yy  = tpad + int(yi * dh/100)
+            cv.create_line(legend_x, yy, legend_x+6, yy,
+                           fill=val_to_color(val))
 
     def _draw_harmonic_lines(self):
         """
@@ -2864,17 +2914,47 @@ class App(tk.Tk):
         self.status_var.set(f"Bank normalized: peak was {global_peak:.4f}, "
                             f"now 1.0 across {len(b.cycles)} cycles.")
 
+    def _toggle_ab(self):
+        """Toggle A/B: show cycles before (A) or after (B) last alignment."""
+        b = self.bank
+        if not b or not self._align_before:
+            self.status_var.set("No alignment performed yet.")
+            return
+        if self._align_ab_mode == "B":
+            self._align_ab_mode   = "A"
+            self._cycles_b_backup = [c.copy() for c in b.cycles]
+            b.cycles = [c.copy() for c in self._align_before]
+            b.audio  = np.concatenate(b.cycles).astype(np.float32)
+            if hasattr(self,'ab_btn') and self.ab_btn:
+                self.ab_btn.config(text="← B (aligned)", bg=C["hot"])
+            self.status_var.set("A/B: showing BEFORE alignment")
+        else:
+            self._align_ab_mode = "B"
+            b.cycles = [c.copy() for c in self._cycles_b_backup]
+            b.audio  = np.concatenate(b.cycles).astype(np.float32)
+            if hasattr(self,'ab_btn') and self.ab_btn:
+                self.ab_btn.config(text="A/B compare", bg=C["accent"])
+            self.status_var.set("A/B: showing AFTER alignment")
+        self._refresh_view()
+        self._build_thumbs()
+        self._draw_coherence()
+
     def _auto_align_cycles(self):
         """
         Align all cycles to cycle[0].
-          auto         → FFT phase if fundamental_strength > 0.4, else xcorr
+          auto         → FFT phase if fund_strength>0.4 else xcorr
           xcorr        → circular cross-correlation (most robust)
-          multiharmonic→ weighted 1/k multi-harmonic cross-correlation
+          multiharmonic→ 1/k weighted spectral cross-correlation
         """
         b = self.bank
         if not b or len(b.cycles) < 2:
             self.status_var.set("Need ≥2 cycles to align.")
             return
+        # Snapshot for A/B
+        self._align_before   = [c.copy() for c in b.cycles]
+        self._align_ab_mode  = "B"
+        if hasattr(self,'ab_btn') and self.ab_btn:
+            self.ab_btn.config(text="A/B compare", bg=C["accent"])
         self._push_undo()
         mode    = getattr(self.align_mode_var, 'get', lambda: 'auto')()
         ref     = b.cycles[0]
@@ -2882,29 +2962,152 @@ class App(tk.Tk):
         ref_ph  = float(np.angle(ref_fft[1]))
         shifts  = []
         for i in range(1, len(b.cycles)):
-            cyc   = b.cycles[i]
+            cyc = b.cycles[i]
             if mode == 'multiharmonic':
                 aligned, k = align_multiharmonic(cyc, ref_fft, n_harm=8)
             elif mode == 'xcorr':
                 aligned, k = align_xcorr(cyc, ref)
-            else:  # auto
-                if fundamental_strength(cyc) > 0.4:
-                    aligned, k = align_fft_phase(cyc, ref_ph)
-                else:
-                    aligned, k = align_xcorr(cyc, ref)
+            else:
+                aligned, k = (align_fft_phase(cyc, ref_ph)
+                              if fundamental_strength(cyc) > 0.4
+                              else align_xcorr(cyc, ref))
             b.cycles[i] = aligned
             shifts.append(k)
         b.audio = np.concatenate(b.cycles).astype(np.float32)
+        # Phase variance reduction score
+        def phase_var(cycs):
+            phs = [float(np.angle(np.fft.rfft(c)[1])) for c in cycs]
+            return float(np.var(phs))
+        var_b = phase_var(self._align_before)
+        var_a = phase_var(b.cycles)
+        pct   = max(0.0, 1.0 - var_a/(var_b+1e-10)) * 100
         self._align_dirty = False
-        if hasattr(self, 'align_dirty_lbl') and self.align_dirty_lbl:
-            self.align_dirty_lbl.config(text="✓ Aligned", fg="#2ecc71")
-        self._draw_harmonic_lines() if self._view_mode == "harmonic_lines" else None
-        self._draw_coherence()
+        if hasattr(self,'align_dirty_lbl') and self.align_dirty_lbl:
+            self.align_dirty_lbl.config(
+                text=f"✓ Aligned  phase-var ↓{pct:.0f}%", fg="#2ecc71")
+        self._refresh_view()
         self._build_thumbs()
+        self._draw_coherence()
         self.status_var.set(
-            f"Aligned {len(shifts)} cycles (mode: {mode}) — "
-            f"shifts: {[f'{k:+d}' for k in shifts[:4]]}"
-            + ("..." if len(shifts) > 4 else ""))
+            f"Aligned {len(shifts)} cycles (mode:{mode}) "
+            f"phase-var ↓{pct:.0f}%  "
+            f"shifts:{[str(k) for k in shifts[:4]]}"
+            + ("…" if len(shifts)>4 else ""))
+
+
+    def _draw_harmonic_phase(self):
+        """
+        Phase view: each harmonic displayed as a sine at its own frequency,
+        shifted horizontally by its phase. φ=0 → normal; φ=π/2 → shift left T/4.
+        Directly shows phase alignment or misalignment at a glance.
+        """
+        cv = self.wave_cv
+        cv.delete("all")
+        if not self.cycles:
+            return
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 10: return
+        n_harm = 12
+        lpad, rpad, tpad, bpad = 50, 8, 4, 16
+        dw   = w - lpad - rpad
+        row_h = (h - tpad - bpad) / n_harm
+        cyc     = self.cycles[self.cycle_idx]
+        phases  = extract_phases(cyc, n_harm)
+        amps    = extract_harmonics(cyc, n_harm)
+        palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
+                   "#c77dff","#f4845f","#48cae4","#e9c46a",
+                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc"]
+        lbls = ["H1(F)","H2","H3","H4","H5","H6","H7","H8","H9","H10","H11","H12"]
+        # Delta phases to next cycle
+        has_next = len(self.cycles) > 1
+        if has_next:
+            next_idx    = (self.cycle_idx+1) % len(self.cycles)
+            phases_next = extract_phases(self.cycles[next_idx], n_harm)
+        for hi in range(n_harm):
+            if self._harmonic_filter and hi not in self._harmonic_filter:
+                continue
+            color  = palette[hi % len(palette)]
+            amp    = float(amps[hi])
+            ph     = float(phases[hi])
+            y_cen  = tpad + hi * row_h + row_h/2
+            half_h = row_h * 0.44 * max(amp, 0.03)
+            # Zero line
+            cv.create_line(lpad, y_cen, w-rpad, y_cen,
+                           fill=C["grid"], dash=(2,4))
+            # Sine shifted by phase (fill full width)
+            pts = []
+            for px in range(int(dw)):
+                t_n = px / dw
+                val = np.sin(2*np.pi*(hi+1)*t_n + ph)
+                pts.extend([lpad+px, y_cen - float(val)*half_h])
+            if len(pts) >= 4:
+                cv.create_line(*pts, fill=color, width=1.2)
+            # Label + phase angle
+            ph_deg = np.degrees(ph)
+            cv.create_text(lpad-3, y_cen, text=lbls[hi],
+                           font=("Consolas",6), fill=color, anchor="e")
+            cv.create_text(w-rpad-2, y_cen,
+                           text=f"{ph_deg:+.0f}°",
+                           font=("Consolas",6), fill=color, anchor="e")
+            # Delta phase indicator
+            if has_next:
+                dph = delta_phase(ph, float(phases_next[hi]))
+                dph_deg = np.degrees(dph)
+                dcol = "#2ecc71" if dph_deg < 10 else ("#e67e22" if dph_deg < 45 else "#c0392b")
+                cv.create_text(w-rpad-40, y_cen,
+                               text=f"Δ{dph_deg:.0f}°",
+                               font=("Consolas",6), fill=dcol, anchor="e")
+        # Header
+        cv.create_text(lpad+dw//2, tpad+1,
+                       text=f"C{self.cycle_idx+1} harmonic phases"
+                            + (f"  |  Δφ→C{next_idx+1}" if has_next else ""),
+                       font=("Consolas",7), fill=C["muted"], anchor="n")
+
+    def _draw_fft_reconstruct(self):
+        """
+        FFT reconstruction debug.
+        Shows: original | IFFT(FFT(cycle)) | residual difference.
+        For a correct implementation, residual should be near machine epsilon.
+        """
+        cv = self.wave_cv
+        cv.delete("all")
+        if not self.cycles:
+            return
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 10: return
+        lpad, rpad, tpad, bpad = 32, 8, 6, 14
+        dw  = w - lpad - rpad
+        dh  = h - tpad - bpad
+        sh  = dh // 3   # height per section
+        cyc      = self.cycles[self.cycle_idx]
+        recon    = reconstruct_from_fft(cyc)
+        residual = cyc - recon
+        max_res  = float(np.max(np.abs(residual)))
+        rms_res  = float(np.sqrt(np.mean(residual**2)))
+        # Zoom window
+        zs = max(0, self._zoom_start)
+        ze = len(cyc) if self._zoom_end < 0 else min(self._zoom_end, len(cyc))
+        scale = max(float(np.max(np.abs(cyc))), 1e-6)
+
+        def draw_section(data, y0, color, label):
+            n = len(data)
+            sc = max(float(np.max(np.abs(data))), scale, 1e-9)
+            cv.create_line(lpad, y0+sh//2, w-rpad, y0+sh//2,
+                           fill=C["grid"], dash=(2,4))
+            pts = []
+            for i, v in enumerate(data):
+                pts.extend([lpad+i/max(n-1,1)*dw, y0+sh//2 - float(v)/sc*(sh//2-3)])
+            if len(pts) >= 4:
+                cv.create_line(*pts, fill=color, width=1.5)
+            cv.create_text(lpad+3, y0+3, text=label,
+                           font=("Consolas",7), fill=color, anchor="nw")
+
+        draw_section(cyc[zs:ze],      tpad,      C["wave"],  "Original")
+        draw_section(recon[zs:ze],    tpad+sh,   "#ce93d8",  "IFFT(FFT) reconstruct")
+        draw_section(residual[zs:ze], tpad+2*sh, "#ff6b6b",
+                     f"Residual  max={max_res:.2e}  rms={rms_res:.2e}")
+        for yi in [tpad+sh, tpad+2*sh]:
+            cv.create_line(lpad, yi, w-rpad, yi, fill=C["muted"], dash=(4,4))
 
     def _bake_morph(self):
         """Add the current morphed waveform as a new cycle in the bank."""
