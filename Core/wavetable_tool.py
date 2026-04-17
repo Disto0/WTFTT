@@ -606,6 +606,7 @@ class App(tk.Tk):
         self._show_overlay_var       = None
         self._show_legend_var        = None
         self._harmonic_filter: set   = set()
+        self._lines_normalized: bool  = True   # per-harmonic norm in Lines mode
         # Zoom state
         self._zoom_start: int = 0
         self._zoom_end:   int = -1
@@ -846,6 +847,8 @@ class App(tk.Tk):
         self._sep(p)
 
         # Export buttons
+        self._btn(p, "Normalize bank (uniform)", self._normalize_bank).pack(
+            fill="x", padx=10, pady=2)
         for txt, cmd in [("Export current cycle",    self._exp_solo),
                          ("Export separate WAVs",    self._exp_separate),
                          ("Export unified WAV",      self._exp_unified)]:
@@ -926,6 +929,14 @@ class App(tk.Tk):
         tk.Checkbutton(tab_row, text="Legend",
                        variable=self._show_legend_var,
                        command=self._refresh_view,
+                       bg=C["bg"], fg=C["text"],
+                       selectcolor=C["accent"],
+                       activebackground=C["bg"],
+                       font=("Consolas", 8)).pack(side="left", padx=2)
+        self._lines_norm_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(tab_row, text="Norm",
+                       variable=self._lines_norm_var,
+                       command=self._on_lines_norm_toggle,
                        bg=C["bg"], fg=C["text"],
                        selectcolor=C["accent"],
                        activebackground=C["bg"],
@@ -2479,13 +2490,12 @@ class App(tk.Tk):
             self._selected_cycles.discard(idx)
         else:
             self._selected_cycles.add(idx)
-        # No auto-overlay — user controls checkbox
-        # Just redraw FFT with colored overlay bars per selection
         self._build_thumbs()
         self._draw_fft()
+        self._draw_fft_overlay()   # always show FFT overlay when selection exists
 
-    def _draw_overlay(self):
-        """Draw selected cycles as colored overlays on the wave canvas."""
+    def _draw_wave_overlay(self):
+        """Dashed waveform overlay for selected cycles (controlled by Overlay checkbox)."""
         if not self._selected_cycles or not self.cycles:
             return
         cv = self.wave_cv
@@ -2493,15 +2503,14 @@ class App(tk.Tk):
         if w < 10: return
         lpad, rpad, tpad, bpad = 32, 8, 6, 18
         dw, dh = w-lpad-rpad, h-tpad-bpad
-        # Color palette for overlays
         palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
-                   "#c77dff","#f4845f","#48cae4","#e9c46a"]
+                   "#c77dff","#f4845f","#48cae4","#e9c46a",
+                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc"]
         legend_y = tpad + 4
         for i, sel_idx in enumerate(sorted(self._selected_cycles)):
             if sel_idx >= len(self.cycles): continue
             cyc   = self.cycles[sel_idx]
             color = palette[i % len(palette)]
-            # Apply zoom
             zs = max(0, self._zoom_start)
             ze = len(cyc) if self._zoom_end < 0 else min(self._zoom_end, len(cyc))
             view = cyc[zs:ze]
@@ -2512,8 +2521,7 @@ class App(tk.Tk):
                 pts.extend([x, y])
             if len(pts) >= 4:
                 cv.create_line(*pts, fill=color, width=1, dash=(4,2))
-            # Legend on waveform canvas
-            if self._show_legend_var.get():
+            if self._show_legend_var and self._show_legend_var.get():
                 label, _ = classify_cycle(cyc)
                 cv.create_rectangle(lpad+4, legend_y, lpad+14, legend_y+8,
                                     fill=color, outline="")
@@ -2521,23 +2529,40 @@ class App(tk.Tk):
                                text=f"C{sel_idx+1} {label}",
                                font=("Consolas",7), fill=color, anchor="w")
                 legend_y += 12
-            # FFT overlay — thin colored bars on FFT canvas
-            _, fft_sel = classify_cycle(cyc)
-            fc = self.fft_cv
-            fw, fh = fc.winfo_width(), fc.winfo_height()
-            if fw < 10: continue
+
+    def _draw_overlay(self):
+        """Compatibility alias."""
+        self._draw_wave_overlay()
+
+    def _draw_fft_overlay(self):
+        """Thin colored bars on FFT canvas per selected cycle — always active."""
+        if not self._selected_cycles or not self.cycles:
+            return
+        palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
+                   "#c77dff","#f4845f","#48cae4","#e9c46a",
+                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc"]
+        fc = self.fft_cv
+        fw, fh = fc.winfo_width(), fc.winfo_height()
+        if fw < 10: return
+        lp_f = 26; tp_f = 6; bp_f = 18
+        dh_f   = fh - tp_f - bp_f
+        n_sel  = len(self._selected_cycles)
+        for i, sel_idx in enumerate(sorted(self._selected_cycles)):
+            if sel_idx >= len(self.cycles): continue
+            _, fft_sel = classify_cycle(self.cycles[sel_idx])
             n_fo   = min(len(fft_sel), 12)
-            lp_f   = 26; bp_f = 18; tp_f = 6
-            dh_f   = fh - tp_f - bp_f
             slot_f = (fw - lp_f) / max(n_fo, 1)
-            bw_f   = max(2, int(slot_f * 0.25))
+            bw_f   = max(2, int(slot_f * 0.22))
+            x_off  = int(slot_f * 0.14) * i
             for ii in range(n_fo):
                 if self._harmonic_filter and ii not in self._harmonic_filter:
                     continue
-                bh_f = int(float(fft_sel[ii]) * dh_f)
-                xf   = int(lp_f + ii*slot_f + (slot_f-bw_f)/2) + i*3
+                bh_f    = int(float(fft_sel[ii]) * dh_f)
+                xf      = int(lp_f + ii*slot_f + (slot_f-bw_f)/2) + x_off
+                bar_col = palette[ii % len(palette)]
                 fc.create_rectangle(xf, tp_f+dh_f-bh_f, xf+bw_f, tp_f+dh_f,
-                                    fill=color, outline="")
+                                    fill=bar_col, outline="")
+
 
     def _draw_heatmap(self):
         """Draw spectral heatmap: cycles (Y) × harmonics (X), color = amplitude."""
@@ -2602,6 +2627,8 @@ class App(tk.Tk):
         lpad, rpad, tpad, bpad = 46, 8, 6, 18
         dw, dh = w - lpad - rpad, h - tpad - bpad
         # Y axis labels and grid
+        cv.create_text(lpad-3, tpad+2, text=getattr(self,'_lines_normalized',True) and "norm" or "real",
+                       font=("Consolas",6), fill=C["hot"], anchor="e")
         for yv, lbl in [(0.0,"0"),(0.25,".25"),(0.5,".5"),(0.75,".75"),(1.0,"1")]:
             y = tpad + (1 - yv) * dh
             cv.create_line(lpad, y, w-rpad, y, fill=C["grid"], dash=(2,4))
@@ -2610,7 +2637,7 @@ class App(tk.Tk):
         palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
                    "#c77dff","#f4845f","#48cae4","#e9c46a",
                    "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc"]
-        # Extract and normalize harmonic profiles
+        # Extract harmonic profiles
         profiles = []
         for c in self.cycles:
             fft  = np.abs(np.fft.rfft(c))
@@ -2618,11 +2645,21 @@ class App(tk.Tk):
                     for i in range(n_harm)]
             profiles.append(amps)
         profiles = np.array(profiles, dtype=np.float32)
-        for hi in range(n_harm):
-            col = profiles[:, hi]
-            mn, mx = float(col.min()), float(col.max())
-            if mx > mn:
-                profiles[:, hi] = (col - mn) / (mx - mn)
+        use_norm = getattr(self, '_lines_normalized', True)
+        if use_norm:
+            # Per-harmonic normalization: each Hi scaled to its own [min,max]
+            for hi in range(n_harm):
+                col = profiles[:, hi]
+                mn, mx = float(col.min()), float(col.max())
+                if mx > mn:
+                    profiles[:, hi] = (col - mn) / (mx - mn)
+            y_label = "norm"
+        else:
+            # Real mode: normalize by global max so Y=1 = loudest harmonic overall
+            gmax = float(profiles.max())
+            if gmax > 0:
+                profiles /= gmax
+            y_label = "real"
         # Draw lines
         n_cyc    = len(self.cycles)
         legend_y = tpad + 2
@@ -2720,6 +2757,32 @@ class App(tk.Tk):
             self._draw_fft()
             if self._view_mode == "harmonic_lines":
                 self._draw_harmonic_lines()
+
+    def _on_lines_norm_toggle(self):
+        """Toggle per-harmonic normalization in Lines view."""
+        self._lines_normalized = self._lines_norm_var.get()
+        if self._view_mode == "harmonic_lines":
+            self._draw_harmonic_lines()
+
+    def _normalize_bank(self):
+        """
+        Normalize all cycles in the bank to the same peak amplitude.
+        Finds the global peak across ALL cycles and divides everything by it.
+        This preserves inter-cycle amplitude relationships (unlike per-cycle normalize).
+        """
+        b = self.bank
+        if not b or not b.cycles:
+            return
+        self._push_undo()
+        global_peak = max(float(np.max(np.abs(c))) for c in b.cycles)
+        if global_peak < 1e-10:
+            self.status_var.set("Bank is silent — nothing to normalize.")
+            return
+        b.cycles = [c / global_peak for c in b.cycles]
+        b.audio  = np.concatenate(b.cycles).astype(np.float32)
+        self._refresh()
+        self.status_var.set(f"Bank normalized: peak was {global_peak:.4f}, "
+                            f"now 1.0 across {len(b.cycles)} cycles.")
 
     def _bake_morph(self):
         """Add the current morphed waveform as a new cycle in the bank."""
@@ -2919,8 +2982,7 @@ class App(tk.Tk):
         self.cycle_badge.config(
             text=label.upper(),
             fg=LABEL_COLORS.get(label, C["muted"]))
-        self._draw_wave()
-        self._draw_fft()
+        self._refresh_view()   # respects current view tab
         self._build_thumbs()
         self._draw_coherence()
         if self.morph_var is not None:
