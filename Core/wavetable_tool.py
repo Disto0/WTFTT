@@ -952,6 +952,8 @@ class App(tk.Tk):
                            font=("Consolas", 8)).pack(side="left", padx=2)
         self._btn(p, "Auto-align cycles", self._auto_align_cycles).pack(
             fill="x", padx=10, pady=2)
+        self.ab_btn = self._btn(p, "A/B compare", self._toggle_ab)
+        self.ab_btn.pack(fill="x", padx=10, pady=2)
         self.align_dirty_lbl = tk.Label(p, text="",
                                         font=("Consolas", 8),
                                         bg=C["panel"], fg="#e67e22")
@@ -2506,8 +2508,8 @@ class App(tk.Tk):
                 yy=tp2+(1.-vv)*dh2
                 fc.create_line(lp2,yy,fw,yy,fill=C["grid"],dash=(3,3))
                 fc.create_text(lp2-3,yy,text=ll,font=("Consolas",7),fill=C["muted"],anchor="e")
-            lbls=["F","2","3","4","5","6","7","8","9","10","11","12"]
-            for ii in range(min(len(fft_m),12)):
+            lbls=["F","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16"]
+            for ii in range(min(len(fft_m),16)):
                 bh2=int(float(fft_m[ii])*dh2); xx=int(lp2+ii*slot+(slot-bw2)/2)
                 fc.create_rectangle(xx,tp2+dh2-bh2,xx+bw2,tp2+dh2,
                                     fill="#ce93d8" if ii==0 else C["fft"],outline="")
@@ -2551,17 +2553,22 @@ class App(tk.Tk):
             # Use fewer steps for performance (one rect per step, not per pixel)
             n_steps = min(w, 120)
             path = build_morph_coherence_path(self.cycles, n_steps=n_steps)
-            fh2  = h - row_h - 1
+            fh2    = h - row_h - 2   # full available height of bottom section
             step_w = w / n_steps
             for xi in range(n_steps):
                 score_px = float(path[xi])
+                # Color: red (low coherence) → green (high coherence)
                 r   = int(min(255, max(0, int((1-score_px)*2*255))))
                 g   = int(min(255, max(0, int(score_px*2*255))))
                 col = f"#{r:02x}{g:02x}40"
-                bh2 = max(1, int(score_px * fh2))
+                # Height: proportional to score (0=flat line, 1=full height)
+                bh2 = max(2, int(score_px * fh2))
                 x0  = int(xi * step_w)
-                x1  = int((xi+1) * step_w)
-                cv.create_rectangle(x0, h-bh2, x1, h, fill=col, outline="")
+                x1  = max(x0+1, int((xi+1) * step_w))
+                # Draw filled bar from bottom up
+                cv.create_rectangle(x0, row_h + fh2 - bh2 + 2,
+                                    x1, row_h + fh2 + 2,
+                                    fill=col, outline="")
             # White cursor = global morph position
             gpos = float(self.global_morph_var.get()) if hasattr(self,'global_morph_var') else 0.0
             xm   = int(gpos * (w-1))
@@ -2628,7 +2635,8 @@ class App(tk.Tk):
         dw, dh = w-lpad-rpad, h-tpad-bpad
         palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
                    "#c77dff","#f4845f","#48cae4","#e9c46a",
-                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc"]
+                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc",
+                   "#e63946","#06d6a0","#118ab2","#ffd166"]
         legend_y = tpad + 4
         for i, sel_idx in enumerate(sorted(self._selected_cycles)):
             if sel_idx >= len(self.cycles): continue
@@ -2663,7 +2671,8 @@ class App(tk.Tk):
             return
         palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
                    "#c77dff","#f4845f","#48cae4","#e9c46a",
-                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc"]
+                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc",
+                   "#e63946","#06d6a0","#118ab2","#ffd166"]
         fc = self.fft_cv
         fw, fh = fc.winfo_width(), fc.winfo_height()
         if fw < 10: return
@@ -2673,7 +2682,7 @@ class App(tk.Tk):
         for i, sel_idx in enumerate(sorted(self._selected_cycles)):
             if sel_idx >= len(self.cycles): continue
             _, fft_sel = classify_cycle(self.cycles[sel_idx])
-            n_fo   = min(len(fft_sel), 12)
+            n_fo   = min(len(fft_sel), 16)
             slot_f = (fw - lp_f) / max(n_fo, 1)
             bw_f   = max(2, int(slot_f * 0.22))
             x_off  = int(slot_f * 0.14) * i
@@ -2775,7 +2784,7 @@ class App(tk.Tk):
             return
         w, h = cv.winfo_width(), cv.winfo_height()
         if w < 10: return
-        n_harm = 12
+        n_harm = 16
         lpad, rpad, tpad, bpad = 46, 8, 6, 18
         dw, dh = w - lpad - rpad, h - tpad - bpad
         # Y axis labels and grid
@@ -2788,7 +2797,8 @@ class App(tk.Tk):
                            font=("Consolas",7), fill=C["muted"], anchor="e")
         palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
                    "#c77dff","#f4845f","#48cae4","#e9c46a",
-                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc"]
+                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc",
+                   "#e63946","#06d6a0","#118ab2","#ffd166"]
         # Extract harmonic profiles
         profiles = []
         for c in self.cycles:
@@ -2892,7 +2902,7 @@ class App(tk.Tk):
         w = self.fft_cv.winfo_width()
         if w < 10 or not self.cycles: return
         _, fft = classify_cycle(self.cycles[self.cycle_idx])
-        n      = min(len(fft), 12)
+        n      = min(len(fft), 16)
         lp2    = 26
         slot   = (w - lp2) / max(n, 1)
         h_idx  = int((event.x - lp2) / max(slot, 1))
@@ -3029,7 +3039,7 @@ class App(tk.Tk):
             return
         w, h = cv.winfo_width(), cv.winfo_height()
         if w < 10: return
-        n_harm = 12
+        n_harm = 16
         lpad, rpad, tpad, bpad = 50, 8, 4, 16
         dw   = w - lpad - rpad
         row_h = (h - tpad - bpad) / n_harm
@@ -3038,8 +3048,10 @@ class App(tk.Tk):
         amps    = extract_harmonics(cyc, n_harm)
         palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
                    "#c77dff","#f4845f","#48cae4","#e9c46a",
-                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc"]
-        lbls = ["H1(F)","H2","H3","H4","H5","H6","H7","H8","H9","H10","H11","H12"]
+                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc",
+                   "#e63946","#06d6a0","#118ab2","#ffd166"]
+        lbls = ["H1(F)","H2","H3","H4","H5","H6","H7","H8",
+                 "H9","H10","H11","H12","H13","H14","H15","H16"]
         # Delta phases to next cycle
         has_next = len(self.cycles) > 1
         if has_next:
@@ -3410,13 +3422,13 @@ class App(tk.Tk):
         if w < 10 or h < 10:
             return
         _, fft = classify_cycle(self.cycles[self.cycle_idx])
-        n      = min(len(fft), 12)
+        n      = min(len(fft), 16)
         # Margins for Y axis
         lpad, bpad, tpad = 26, 18, 6
         dh    = h - tpad - bpad
         slot  = (w - lpad) / max(n, 1)
         bw    = max(4, int(slot * 0.65))
-        lbls  = ["F","2","3","4","5","6","7","8","9","10","11","12"]
+        lbls  = ["F","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16"]
         # Y axis labels (0, 0.5, 1.0)
         for val, label in [(0.0, "0"), (0.5, ".5"), (1.0, "1")]:
             y = tpad + (1.0 - val) * dh
